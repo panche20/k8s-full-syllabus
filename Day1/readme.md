@@ -45,6 +45,9 @@ This is a classic interview question. Walk through it step by step:
 10. kubelet updates pod status → Running
 ```
 
+<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/c47c010d-7e03-479b-bbdc-e01dfa19639e" />
+
+
 ## Part 4: Hands-On Setup on Your EC2 Ubuntu Instance
 Let's install kind (Kubernetes in Docker) — perfect for your EC2 instance.
 
