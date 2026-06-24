@@ -263,6 +263,14 @@ spec:
 # Install metrics-server (required for HPA)
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 
+Now, edit deployment:
+kubectl edit deployments.apps metrics-server -n kube-system
+
+Add below : - --kubelet-insecure-tls
+
+<img width="862" height="237" alt="image" src="https://github.com/user-attachments/assets/665d230a-4e0e-4542-847b-63f9cbbb4b1b" />
+
+
 # Watch HPA in action
 kubectl get hpa -w
 
