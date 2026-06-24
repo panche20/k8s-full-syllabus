@@ -436,7 +436,7 @@ spec:
       claimName: local-pvc
 EOF
 
-kubectl logs storage-reader
+kubectl exec storage-reader -- cat /data/test.txt
 # data written  ← survived pod deletion
 ```
 
