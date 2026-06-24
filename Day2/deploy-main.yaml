@@ -1,35 +1,37 @@
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: url-shortener
   labels:
-    app: url-shortener
+    app: nginx-deploy
+  name: nginx-deploy
 spec:
-  initContainers:
-  - name: wait-for-redis
-    image: busybox:1.35
-    command: ['sh','-c','until nc -z localhost 6379; do sleep 1; done']
-
-  containers:
-  - name: fastapi
-    image: python:3.11-slim
-    command: ["python","-m","http.server","8000"]  # stand-in for your app
-    resources:
-      requests:
-        memory: "64Mi"
-        cpu: "100m"
-      limits:
-        memory: "128Mi"
-        cpu: "200m"
-    livenessProbe:
-      httpGet:
-        path: /
-        port: 8000
-      initialDelaySeconds: 5
-      periodSeconds: 10
-    readinessProbe:
-      httpGet:
-        path: /
-        port: 8000
-      initialDelaySeconds: 3
-      periodSeconds: 5
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx-deploy
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1               # extra pods above desired during update
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: nginx-deploy
+    spec:
+      containers:
+      - image: nginx
+        name: nginx
+        resources: 
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 3
+          periodSeconds: 5
