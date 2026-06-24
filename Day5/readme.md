@@ -304,12 +304,16 @@ spec:
 EOF
 
 # Watch logs
-kubectl logs config-reader -f &
+kubectl logs config-reader -f
+
+Now, in another terminal:
 
 # Update the ConfigMap — watch logs update within ~60s without restart
 kubectl create configmap live-config \
   --from-literal=MESSAGE="hello v2" \
   --dry-run=client -o yaml | kubectl apply -f -
+
+
 ```
 
 **Exercise 2: Secret — create, consume, decode*
@@ -418,7 +422,11 @@ spec:
   containers:
   - name: reader
     image: busybox
-    command: ["sh","-c","cat /data/test.txt && sleep 3600"]
+    command: 
+    - sh
+    - -c
+    - |
+      sleep 3600
     volumeMounts:
     - name: storage
       mountPath: /data
