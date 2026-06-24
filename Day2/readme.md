@@ -193,38 +193,69 @@ cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
-  name: url-shortener
+  name: advanced-app-pod
   labels:
-    app: url-shortener
+    app: my-web-app
 spec:
+  # ----------------------------------------------------
+  # 1. INIT CONTAINERS (Runs to completion before app starts)
+  # ----------------------------------------------------
   initContainers:
-  - name: wait-for-redis
+  - name: init-db-check
     image: busybox:1.35
-    command: ['sh','-c','until nc -z localhost 6379; do sleep 1; done']
-
-  containers:
-  - name: fastapi
-    image: python:3.11-slim
-    command: ["python","-m","http.server","8000"]  # stand-in for your app
+    command: ['sh', '-c', 'echo "Init tasks complete!"; exit 0']
     resources:
       requests:
-        memory: "64Mi"
-        cpu: "100m"
+        cpu: "50m"
+        memory: "32Mi"
       limits:
-        memory: "128Mi"
-        cpu: "200m"
+        cpu: "100m"
+        memory: "64Mi"
+
+  # ----------------------------------------------------
+  # 2. MAIN APP CONTAINERS
+  # ----------------------------------------------------
+  containers:
+  - name: main-application
+    image: nginx:1.25-alpine
+    ports:
+    - containerPort: 80
+      name: http
+
+    # ----------------------------------------------------
+    # 3. RESOURCES AND LIMITS
+    # ----------------------------------------------------
+    resources:
+      requests:
+        cpu: "250m"      # Guaranteed CPU (0.25 cores)
+        memory: "64Mi"   # Guaranteed Memory
+      limits:
+        cpu: "500m"      # Max CPU allowed (will be throttled if exceeded)
+        memory: "128Mi"  # Max Memory allowed (Pod will OOMKilled if exceeded)
+
+    # ----------------------------------------------------
+    # 4. HEALTH PROBES
+    # ----------------------------------------------------
+    # Liveness: Determines if the container needs to be restarted
     livenessProbe:
       httpGet:
         path: /
-        port: 8000
-      initialDelaySeconds: 5
-      periodSeconds: 10
+        port: 80
+      initialDelaySeconds: 15  # How long to wait after starting before checking
+      periodSeconds: 20        # How often to check
+      timeoutSeconds: 2        # Timeout for each check
+      failureThreshold: 3      # Number of consecutive failures before restarting
+
+    # Readiness: Determines if the container is ready to accept network traffic
     readinessProbe:
       httpGet:
         path: /
-        port: 8000
-      initialDelaySeconds: 3
-      periodSeconds: 5
+        port: 80
+      initialDelaySeconds: 5   # Starts checking much sooner than liveness
+      periodSeconds: 10
+      timeoutSeconds: 2
+      successThreshold: 1      # Must pass 1 time to be considered ready
+      failureThreshold: 2      # If it fails twice, traffic stops being sent here
 EOF
 ```
 
@@ -232,26 +263,26 @@ Exercise 2: Observe pod lifecycle in real time
 
 ```
 # Watch the pod go through phases
-kubectl get pod url-shortener -w
+kubectl get pod advanced-app-pod -w
 
 # See init container running
-kubectl logs url-shortener -c wait-for-redis
+kubectl logs advanced-app-pod -c init-db-check
 
 # See events (scheduling, pulling, starting)
-kubectl describe pod url-shortener | grep -A 20 Events
+kubectl describe pod advanced-app-pod | grep -A 20 Events
 
 # Check QoS class
-kubectl get pod url-shortener -o jsonpath='{.status.qosClass}'
+kubectl get pod advanced-app-pod -o jsonpath='{.status.qosClass}'
 ```
 
 Exercise 3: Trigger a liveness failure
 
 ```
 # Exec into pod and kill the process — watch K8s restart it
-kubectl exec -it url-shortener -- kill 1
+kubectl exec -it advanced-app-pod -- kill 1
 
 # Watch the restart counter increment
-kubectl get pod url-shortener -w
+kubectl get pod advanced-app-pod -w
 # You'll see RESTARTS go from 0 → 1
 ```
 
