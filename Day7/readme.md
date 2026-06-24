@@ -401,11 +401,26 @@ kubectl create quota test-quota \
   -n quota-test
 
 # Try to create 4 pods — 4th should be rejected
-for i in 1 2 3 4; do
-  kubectl run pod-$i --image=nginx:1.25 \
-    --requests=cpu=100m,memory=128Mi \
-    -n quota-test
+
+for i in 1 2 3 4
+do
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-$i
+  namespace: quota-test
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+EOF
 done
+
 # pod-4 fails: exceeded quota
 
 kubectl describe resourcequota -n quota-test
