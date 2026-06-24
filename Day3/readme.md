@@ -50,7 +50,7 @@ spec:
           periodSeconds: 5
 ```
 
-Rolling update deep dive
+**Rolling update deep dive**
 
 ```
 # Trigger a rolling update
@@ -190,7 +190,7 @@ spec:
         command: ["python", "manage.py", "migrate"]
 ```
 
-CronJob — scheduled Jobs
+**CronJob — scheduled Jobs**
 
 ```
 apiVersion: batch/v1
@@ -281,7 +281,8 @@ kubectl top nodes
 ```
 
 ## Part 7: Hands-On Exercises
-Exercise 1: Full Deployment lifecycle
+
+**Exercise 1: Full Deployment lifecycle**
 
 ```
 # Create deployment
@@ -311,8 +312,7 @@ kubectl scale deployment url-shortener --replicas=5
 kubectl get pods -w
 ```
 
-Exercise 2: StatefulSet with stable DNS
-
+**Exercise 2: StatefulSet with stable DNS**
 
 ```
 cat <<EOF | kubectl apply -f -
@@ -361,7 +361,7 @@ kubectl delete pod nginx-sts-1
 kubectl get pods -w   # nginx-sts-1 recreated, NOT a random name
 ```
 
-Exercise 3: CronJob that self-cleans
+**Exercise 3: CronJob that self-cleans**
 
 ```
 cat <<EOF | kubectl apply -f -
@@ -392,7 +392,7 @@ kubectl get jobs -w
 kubectl logs -l job-name=$(kubectl get jobs --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
 ```
 
-Exercise 4: HPA load test
+**Exercise 4: HPA load test**
 
 ```
 # Deploy with resource requests (HPA requires these)
@@ -420,6 +420,7 @@ kubectl delete pod load-gen
 ```
 
 ## Part 8: Interview Questions — Day 3
+
 Q1: Deployment vs StatefulSet — when do you use each?
 
 Deployment for stateless apps (web servers, APIs) — pods are interchangeable, no stable identity needed. StatefulSet for stateful apps (databases, Kafka, Zookeeper) — each pod needs a stable hostname, stable storage, and ordered operations.
