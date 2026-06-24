@@ -1,37 +1,66 @@
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: v1
+kind: Pod
 metadata:
+  name: advanced-app-pod
   labels:
-    app: nginx-deploy
-  name: nginx-deploy
+    app: my-web-app
 spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: nginx-deploy
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1               # extra pods above desired during update
-      maxUnavailable: 0
-  template:
-    metadata:
-      labels:
-        app: nginx-deploy
-    spec:
-      containers:
-      - image: nginx
-        name: nginx
-        resources: 
-          requests:
-            memory: "64Mi"
-            cpu: "100m"
-          limits:
-            memory: "128Mi"
-            cpu: "200m"
-        readinessProbe:
-          httpGet:
-            path: /
-            port: 80
-          initialDelaySeconds: 3
-          periodSeconds: 5
+  # ----------------------------------------------------
+  # 1. INIT CONTAINERS (Runs to completion before app starts)
+  # ----------------------------------------------------
+  initContainers:
+  - name: init-db-check
+    image: busybox:1.35
+    command: ['sh', '-c', 'echo "Init tasks complete!"; exit 0']
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "32Mi"
+      limits:
+        cpu: "100m"
+        memory: "64Mi"
+
+  # ----------------------------------------------------
+  # 2. MAIN APP CONTAINERS
+  # ----------------------------------------------------
+  containers:
+  - name: main-application
+    image: nginx:1.25-alpine
+    ports:
+    - containerPort: 80
+      name: http
+
+    # ----------------------------------------------------
+    # 3. RESOURCES AND LIMITS
+    # ----------------------------------------------------
+    resources:
+      requests:
+        cpu: "250m"      # Guaranteed CPU (0.25 cores)
+        memory: "64Mi"   # Guaranteed Memory
+      limits:
+        cpu: "500m"      # Max CPU allowed (will be throttled if exceeded)
+        memory: "128Mi"  # Max Memory allowed (Pod will OOMKilled if exceeded)
+
+    # ----------------------------------------------------
+    # 4. HEALTH PROBES
+    # ----------------------------------------------------
+    # Liveness: Determines if the container needs to be restarted
+    livenessProbe:
+      httpGet:
+        path: /
+        port: 80
+      initialDelaySeconds: 15  # How long to wait after starting before checking
+      periodSeconds: 20        # How often to check
+      timeoutSeconds: 2        # Timeout for each check
+      failureThreshold: 3      # Number of consecutive failures before restarting
+
+    # Readiness: Determines if the container is ready to accept network traffic
+    readinessProbe:
+      httpGet:
+        path: /
+        port: 80
+      initialDelaySeconds: 5   # Starts checking much sooner than liveness
+      periodSeconds: 10
+      timeoutSeconds: 2
+      successThreshold: 1      # Must pass 1 time to be considered ready
+      failureThreshold: 2      # If it fails twice, traffic stops being sent here
