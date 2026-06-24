@@ -273,7 +273,17 @@ kubectl expose deployment url-shortener --port=80 --target-port=80
 kubectl get svc url-shortener
 
 # Prove it routes — call service from another pod
-kubectl run test-pod --image=busybox:1.35 --rm -it -- wget -O- url-shortener
+kubectl run test-pod --image=busybox:1.35 --restart=Never -it --rm -- sh
+
+Inside : wget -qO- http://url-shortener
+
+Expected Output:
+
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+...
 
 # See which pods are in the endpoints
 kubectl get endpoints url-shortener
@@ -293,52 +303,159 @@ kubectl get endpoints url-shortener   # pods reappear
 # Need Calico for NetworkPolicy — install on kind
 kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
 
-# Deploy two apps
-kubectl run app-a --image=nginx:1.25 --labels=app=app-a
-kubectl run app-b --image=nginx:1.25 --labels=app=app-b
-kubectl expose pod app-a --port=80
-kubectl expose pod app-b --port=80
+Verify Calico is Running:
+kubectl get pods -n calico-system
 
-# Prove open comms (baseline)
-kubectl exec app-b -- wget -qO- http://app-a   # should work
+Create a Dedicated Namespace
+Never test in default namespace.
 
-# Apply default-deny
-cat <<EOF | kubectl apply -f -
+kubectl create namespace network-policy-lab
+
+Deploy Test Applications : app-a.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-a
+  namespace: network-policy-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-a
+  template:
+    metadata:
+      labels:
+        app: app-a
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+
+kubectl apply -f app-a.yaml
+```
+
+**Create app-b.yaml**
+
+```
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-b
+  namespace: network-policy-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-b
+  template:
+    metadata:
+      labels:
+        app: app-b
+    spec:
+      containers:
+      - name: busybox
+        image: busybox:1.35
+        command:
+        - sleep
+        - "36000"
+
+kubectl apply -f app-b.yaml
+```
+
+**Expose app-a**
+
+```
+kubectl expose deployment app-a \
+  --port=80 \
+  --target-port=80 \
+  -n network-policy-lab
+```
+
+**Verify Baseline Connectivity**
+
+```
+kubectl get pods -n network-policy-lab
+
+kubectl exec -it \
+app-b-6f7c4d6d5b-zv9kh \
+-n network-policy-lab \
+-- wget -qO- http://app-a
+```
+
+**Apply Default Deny**
+```
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: deny-all
+  namespace: network-policy-lab
 spec:
   podSelector: {}
-  policyTypes: [Ingress, Egress]
-EOF
+  policyTypes:
+  - Ingress
+  - Egress
 
-# Now it should fail
-kubectl exec app-b -- wget -qO- --timeout=3 http://app-a   # should hang/fail
+kubectl apply -f deny-all.yaml
+```
 
-# Allow app-b → app-a specifically
-cat <<EOF | kubectl apply -f -
+**Test Again**
+
+```
+kubectl exec -it \
+<app-b-pod> \
+-n network-policy-lab \
+-- wget -T 3 -qO- http://app-a
+
+Output: wget: download timed out
+```
+
+**Now, delete netpol - deny-all**: 
+
+```
+kubectl delete netpol deny-all -n network-policy-lab
+```
+
+**Allow app-b → app-a**
+
+Create allow-b-to-a.yaml
+
+```
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-b-to-a
+  namespace: network-policy-lab
 spec:
   podSelector:
     matchLabels:
       app: app-a
-  policyTypes: [Ingress]
+
+  policyTypes:
+  - Ingress
+
   ingress:
   - from:
     - podSelector:
         matchLabels:
           app: app-b
     ports:
-    - port: 80
-EOF
+    - protocol: TCP
+      port: 80
 
-# Now it should work again
-kubectl exec app-b -- wget -qO- http://app-a
+kubectl apply -f allow-b-to-a.yaml
 ```
+
+**Test Again**
+
+```
+kubectl exec -it \
+<app-b-pod> \
+-n network-policy-lab \
+-- wget -qO- http://app-a
+```
+
+
+
 
 **Exercise 3: Ingress with path routing**
 
