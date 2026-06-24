@@ -268,7 +268,8 @@ kubectl edit deployments.apps metrics-server -n kube-system
 
 Add below : - --kubelet-insecure-tls
 
-<img width="862" height="237" alt="image" src="https://github.com/user-attachments/assets/665d230a-4e0e-4542-847b-63f9cbbb4b1b" />
+<img width="862" height="237" alt="image" src="https://github.com/user-attachments/assets/8f0fe00b-3c45-42de-83cd-1886ec124e82" />
+
 
 
 # Watch HPA in action
@@ -349,7 +350,11 @@ EOF
 kubectl get pods -w
 
 # Prove stable DNS — exec and nslookup
-kubectl exec nginx-sts-0 -- nslookup nginx-sts-0.nginx-headless.default.svc.cluster.local
+kubectl exec nginx-sts-0 -- getent hosts nginx-sts-0.nginx-headless.default.svc.cluster.local
+
+or
+
+kubectl exec nginx-sts-0 -- curl -I nginx-sts-1.nginx-headless
 
 # Delete a pod — it comes back with the SAME name
 kubectl delete pod nginx-sts-1
