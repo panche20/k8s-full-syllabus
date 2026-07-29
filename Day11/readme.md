@@ -1154,7 +1154,323 @@ requests.cpu     200m   1
 requests.memory  256Mi  1Gi
 ```
 
+## Task 15 — DaemonSet (5%)
 
+*In namespace cka-15:*
 
+- Create a DaemonSet log-collector with image busybox, command sleep infinity
+- Add a toleration so it runs on control-plane nodes too
+- Verify it has one pod on every node in the cluster (including control plane)
+- Label one node tier=premium
+- Update the DaemonSet with a nodeSelector tier=premium
+- Verify it now runs ONLY on the labeled node
 
+**Solutions**
 
+*Here is the complete step-by-step solution for Task 15.*
+
+## Step 1: Create Namespace cka-15
+
+```
+Bash
+kubectl create namespace cka-15 --dry-run=client -o yaml | kubectl apply -f -
+```
+
+## Step 2: Create the DaemonSet with Control Plane Tolerations
+
+*Apply the log-collector DaemonSet manifest with tolerations matching control-plane node taints (node-role.kubernetes.io/control-plane or node-role.kubernetes.io/master):*
+
+```
+Bash
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: log-collector
+  namespace: cka-15
+spec:
+  selector:
+    matchLabels:
+      app: log-collector
+  template:
+    metadata:
+      labels:
+        app: log-collector
+    spec:
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: collector
+        image: busybox:1.36
+        command: ["sleep", "infinity"]
+EOF
+```
+
+## Step 3: Verify Pods Are Scheduled on Every Node
+
+*Verify that the number of scheduled pods matches the total node count (including control plane nodes):*
+
+```
+Bash
+# Check pod placement across nodes
+kubectl get pods -n cka-15 -o wide
+
+Verification Check: Compare total pods returned with kubectl get nodes. Every node should host 1 log-collector pod.
+```
+
+## Step 4: Label a Single Node with tier=premium
+
+*Pick one node name (for example, k8s-mastery-worker) and apply the label:*
+
+```
+Bash
+# Apply label
+kubectl label node k8s-mastery-worker tier=premium
+```
+
+## Step 5: Update DaemonSet with nodeSelector
+
+*Add the nodeSelector: tier: premium configuration under spec.template.spec:*
+
+```
+Bash
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: log-collector
+  namespace: cka-15
+spec:
+  selector:
+    matchLabels:
+      app: log-collector
+  template:
+    metadata:
+      labels:
+        app: log-collector
+    spec:
+      nodeSelector:
+        tier: premium
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: collector
+        image: busybox:1.36
+        command: ["sleep", "infinity"]
+EOF
+```
+
+## Step 6: Verify Pods Run ONLY on the Labeled Node
+
+*Check active pods in namespace cka-15:*
+
+```
+Bash
+kubectl get pods -n cka-15 -o wide
+Expected Output: Exactly 1 pod remains running, scheduled specifically on k8s-mastery-worker (or whichever node was assigned tier=premium).
+```
+
+## Task 16 — Multi-container pod with init (6%)
+
+*In namespace cka-16:*
+
+- Create a Pod init-demo:
+- Init container: setup, image busybox, writes "init complete" to /work/init.txt
+- Main container: app, image nginx:1.25, reads and serves /work/init.txt
+- Sidecar container: monitor, image busybox, runs while true; do wc -l /work/init.txt; sleep 10; done
+- All three share a volume workdir at /work
+- Verify init ran before main container
+- Verify sidecar can see the file written by init
+
+**Solution**
+
+*Here is the step-by-step solution for Task 16.*
+
+## Step 1: Create Namespace cka-16
+
+```
+Bash
+kubectl create namespace cka-16 --dry-run=client -o yaml | kubectl apply -f -
+```
+
+## Step 2: Create the Pod Manifest init-demo
+
+*Apply the multi-container pod manifest containing an initContainer, two main containers (app and monitor), and a shared emptyDir volume workdir:*
+
+```
+Bash
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: init-demo
+  namespace: cka-16
+spec:
+  volumes:
+  - name: workdir
+    emptyDir: {}
+  initContainers:
+  - name: setup
+    image: busybox:1.36
+    command: ["sh", "-c", "echo 'init complete' > /work/init.txt"]
+    volumeMounts:
+    - name: workdir
+      mountPath: /work
+  containers:
+  - name: app
+    image: nginx:1.25
+    volumeMounts:
+    - name: workdir
+      mountPath: /work
+  - name: monitor
+    image: busybox:1.36
+    command: ["sh", "-c", "while true; do wc -l /work/init.txt; sleep 10; done"]
+    volumeMounts:
+    - name: workdir
+      mountPath: /work
+EOF
+```
+
+## Step 3: Run Verification Checks
+
+**Test 1: Verify Init Container Execution & Main Container Access**
+
+*Confirm the main app container can access /work/init.txt created by setup:*
+
+```
+Bash
+kubectl exec -n cka-16 init-demo -c app -- cat /work/init.txt
+Expected Output:
+
+Plaintext
+init complete
+```
+
+**Test 2: Verify Sidecar Container Logs**
+
+*Check the logs of the monitor sidecar container to confirm it is actively reading and counting lines in /work/init.txt:*
+
+```
+Bash
+kubectl logs -n cka-16 init-demo -c monitor
+Expected Output:
+
+Plaintext
+1 /work/init.txt
+1 /work/init.txt
+```
+
+## Task 17 — Cluster-level operations (6%)
+
+- Find all pods across all namespaces NOT in Running state — write their names and namespaces to /tmp/not-running-pods.txt
+- Find the pod consuming the most CPU across all namespaces — write its name, namespace, and CPU usage to /tmp/top-pod.txt
+- Find all PVs and sort them by capacity — write to /tmp/pvs-sorted.txt
+- Count the total number of nodes that are Ready — write the count to /tmp/ready-nodes.txt
+
+**Solution**
+
+*Here are the exact one-liner shell commands to satisfy all 4 sub-tasks in Task 17.*
+
+## Step 1: Find Non-Running Pods Across All Namespaces
+
+*Find all pods where status.phase is not Running and write NAMESPACE POD_NAME to /tmp/not-running-pods.txt:*
+
+```
+Bash
+kubectl get pods -A --field-selector=status.phase!=Running --no-headers -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" > /tmp/not-running-pods.txt
+```
+
+## Step 2: Find Pod Consuming Most CPU
+
+*Query metrics via kubectl top pods, sort by CPU usage, and output the top pod's name, namespace, and CPU value to /tmp/top-pod.txt:*
+
+```
+Bash
+kubectl top pods -A --no-headers | sort -nk3 | tail -n 1 | awk '{print $2, $1, $3}' > /tmp/top-pod.txt
+Format in /tmp/top-pod.txt: <pod-name> <namespace> <cpu-usage>
+```
+
+## Step 3: Find and Sort PVs by Capacity
+
+*Get all PersistentVolumes sorted by storage capacity:*
+
+```
+Bash
+kubectl get pv --sort-by=.spec.capacity.storage > /tmp/pvs-sorted.txt
+```
+
+## Step 4: Count Ready Nodes
+
+*Filter and count all nodes currently in Ready status and save the integer count to /tmp/ready-nodes.txt:*
+
+```
+Bash
+kubectl get nodes -o jsonpath='{range .items[*]}{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' | grep -i "True" | wc -l > /tmp/ready-nodes.txt
+```
+
+**Verification Checks**
+
+*Run these commands to verify that all output files exist and contain data:*
+
+```
+Bash
+cat /tmp/not-running-pods.txt
+cat /tmp/top-pod.txt
+cat /tmp/pvs-sorted.txt
+cat /tmp/ready-nodes.txt
+```
+
+## Speed Reference Card
+
+```
+# Namespace shortcut — set once per task
+kubectl config set-context --current --namespace=cka-5
+
+# Generate YAML fast
+k create sa deploy-manager $do
+k create role r1 --verb=get,list --resource=pods $do
+k create rolebinding rb1 --role=r1 --serviceaccount=ns:sa $do
+k create deployment d1 --image=nginx:1.25 --replicas=3 $do
+k create configmap cm1 --from-literal=key=val $do
+k create secret generic s1 --from-literal=key=val $do
+k create pv  # no imperative — must write YAML
+k create pvc # no imperative — must write YAML
+
+# Edit live resource
+k edit deployment webapp -n cka-10
+
+# Force delete stuck pod
+k delete pod stuck-pod $now
+
+# Watch rollout
+k rollout status deployment/webapp -n cka-10
+
+# Check everything
+k get all -n cka-5
+k describe pod <name> | grep -A 10 Events
+
+# Write command output to file
+k get nodes -o wide > /tmp/nodes.txt
+
+# Check cert expiry fast
+docker exec k8s-mastery-control-plane \
+  kubeadm certs check-expiration
+
+# etcd backup one-liner
+docker exec k8s-mastery-control-plane bash -c "
+ETCDCTL_API=3 etcdctl snapshot save /tmp/etcd-snapshot.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key"
+```
