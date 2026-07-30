@@ -1,0 +1,121 @@
+Core DNS : kubectl get configmap coredns -n kube-system -o yaml
+apiVersion: v1
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health {
+           lameduck 5s
+        }
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+           pods insecure
+           fallthrough in-addr.arpa ip6.arpa
+           ttl 30
+        }
+        prometheus :9153
+        forward . /etc/resolv.conf {
+           max_concurrent 1000
+        }
+        cache 30 {
+           disable success cluster.local
+           disable denial cluster.local
+        }
+        loop
+        reload
+        loadbalance
+    }
+kind: ConfigMap
+metadata:
+  creationTimestamp: "2026-07-30T05:36:08Z"
+  name: coredns
+  namespace: kube-system
+  resourceVersion: "262"
+  uid: 072d0876-ea58-4634-b6a0-cc90b784b5d5
+
+This is the standard Kubernetes ConfigMap used to configure CoreDNS, which is the internal DNS server running inside your Kubernetes cluster.
+CoreDNS resolves domain names for your pods and services (like mapping my-service.default.svc.cluster.local to an internal IP address).
+
+1. Top-Level Kubernetes Wrapper
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+
+kind: ConfigMap: A Kubernetes object used to store non-confidential configuration data in key-value pairs.
+
+namespace: kube-system: Lives in the system namespace where core Kubernetes components run.
+
+data.Corefile: The key Corefile holds the actual CoreDNS configuration string.
+
+2. CoreDNS Configuration (Corefile) Breakdown
+The block starting with .:53 { ... } means: "Listen for all DNS queries on port 53 (the standard DNS port)."
+
+Here is what each plugin block inside does:
+
+🛠️ Basic Health & Management
+errors: Logs any errors that occur during DNS resolution to standard error (stderr).
+
+health { lameduck 5s }: Exposes a health endpoint for Kubernetes liveness probes. When shutting down, it enters a "lameduck" period for 5 seconds to let existing connections finish before stopping.
+
+ready: Exposes an HTTP readiness probe on port 8181 so Kubernetes knows when CoreDNS is ready to accept traffic.
+
+reload: Automatically reloads the configuration whenever this ConfigMap is modified—no need to restart the CoreDNS pods manually!
+
+🌐 Kubernetes Cluster DNS Resolution
+DNS Zone file
+kubernetes cluster.local in-addr.arpa ip6.arpa {
+   pods insecure
+   fallthrough in-addr.arpa ip6.arpa
+   ttl 30
+}
+cluster.local: The default domain suffix for your Kubernetes cluster. CoreDNS listens for queries ending in this zone.
+
+pods insecure: Resolves pod IP addresses directly (e.g., 10-244-0-5.default.pod.cluster.local). The insecure setting allows backward-compatible A-record lookups without strict IP checking.
+
+fallthrough ...: If a reverse DNS lookup (in-addr.arpa for IPv4 or ip6.arpa for IPv6) isn't matched by the kubernetes plugin, pass it down to the next plugins (like forward).
+
+ttl 30: Sets the Time-To-Live for DNS responses to 30 seconds.
+
+🔄 External Forwarding & Performance
+DNS Zone file
+forward . /etc/resolv.conf {
+   max_concurrent 1000
+}
+forward . /etc/resolv.conf: If a query isn't inside cluster.local (for example, looking up google.com), CoreDNS forwards it to the upstream DNS servers defined in the node's /etc/resolv.conf.
+
+max_concurrent 1000: Caps concurrent upstream DNS queries at 1,000 to prevent overwhelming external DNS servers under high load.
+
+DNS Zone file
+cache 30 {
+   disable success cluster.local
+   disable denial cluster.local
+}
+Caches external DNS responses for up to 30 seconds.
+
+disable ... cluster.local: Disables caching for internal cluster addresses so that new Kubernetes service IP changes are picked up instantly without waiting for cache expiration.
+
+📊 Monitoring & Routing
+prometheus :9153: Exposes CoreDNS metrics for Prometheus scrapers on port 9153.
+
+loop: Detects simple DNS forwarding loops (e.g., if /etc/resolv.conf points back to CoreDNS itself) and halts CoreDNS to prevent infinite loops.
+
+loadbalance: Randomizes the order of A/AAAA records in responses when a service has multiple pods, spreading traffic evenly.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
