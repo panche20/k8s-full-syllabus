@@ -683,17 +683,111 @@ kubectl get pods -A -o json \
 
 **Exercise 4: Tighten a real namespace end-to-end**
 
+## Step 1: Inspect the Target Workloads
 
+*Check the existing workloads running in the monitoring namespace. You will see daemonsets like node-exporter that rely on host networking, host path mounts, and elevated capabilities.*
 
+```
+kubectl get pods,daemonsets,deployments -n monitoring
+```
 
+## Step 2: Enable Audit and Warning Modes
 
+*Apply restricted mode for both audit and warn. This lets you measure compliance without disrupting active pods.*
 
+```
+kubectl label namespace monitoring \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/audit-version=latest \
+  pod-security.kubernetes.io/warn=restricted \
+  pod-security.kubernetes.io/warn-version=latest \
+  --overwrite
+```
 
+*Verify that the labels were added correctly:*
 
+```
+kubectl get ns monitoring --show-labels
+```
 
+## Step 3: Directly Trigger & Observe PSA Warnings
 
+*Deleting an existing pod managed by a Deployment or DaemonSet recreates the pod asynchronously in the background via a controller, so standard terminal output will not display API warnings.*
 
+**Use these two techniques to inspect how PSA evaluates workloads:**
 
+## Approach A: Immediate Verification via Server Dry-Run
+
+*Run a server dry-run of a non-compliant pod directly against the namespace to view immediate API feedback:*
+
+```
+kubectl run psa-test --image=nginx:1.25 -n monitoring --dry-run=server
+```
+
+**Expected Output:**
+
+```
+Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false, ...
+pod/psa-test created (server dry run)
+```
+
+## Approach B: Trigger Controller-Level Warnings
+
+*Force a rollout restart on an existing workload (e.g., node-exporter) to trigger background reconciliation warnings:*
+
+```
+kubectl rollout restart daemonset -n monitoring
+```
+
+*Check the warning events logged in the namespace:*
+
+```
+kubectl get events -n monitoring --field-selector type=Warning
+```
+
+## Step 4: Verify Policy Compatibility Before Enforcing
+
+*If you enforce restricted on monitoring, node-exporter will fail to create pods because it requires hostPath mounts to gather host metrics.*
+
+**Run a server dry-run against the baseline security standard to verify compatibility:**
+
+```
+kubectl run baseline-test --image=prom/node-exporter:v1.7.0 -n monitoring --dry-run=server
+```
+
+*Because baseline allows host paths while preventing core privilege escalations (like running fully privileged containers), it is the correct policy level for this namespace.*
+
+## Step 5: Lock Down the Namespace with enforce=baseline
+
+*Now apply enforce=baseline to lock down the namespace.*
+
+```
+kubectl label namespace monitoring \
+  pod-security.kubernetes.io/enforce=baseline \
+  pod-security.kubernetes.io/enforce-version=latest \
+  --overwrite
+```
+
+## Step 6: Test Enforcement Controls
+
+*To confirm that enforcement is working, attempt to create a privileged pod (which is forbidden under both baseline and restricted):*
+
+```
+kubectl run malicious-pod --image=nginx:1.25 -n monitoring --privileged
+```
+
+**Expected Output:**
+
+```
+Error from server (Forbidden): pods "malicious-pod" is forbidden: 
+violates PodSecurity "baseline:latest": privileged (container "malicious-pod" must not set securityContext.privileged=true)
+```
+
+*Finally, review your completed namespace security configuration:*
+
+```
+kubectl get ns monitoring -o yaml
+```
 
 
 ## 🎯 Part 8: Interview Questions — Day 13
