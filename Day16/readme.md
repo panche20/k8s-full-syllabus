@@ -300,6 +300,105 @@ Falco is running on your cluster.
     - Output includes: container name, image, process name, command line
 - Apply the custom rule to Falco and prove it fires when you run nc inside a pod
 
+**Solution**
+
+### Step 1: Confirm Falco Pod and Verify Rules are Loading
+
+Check that the Falco pod is running and inspect its startup logs:
+
+```
+# Get the running Falco pod name
+FALCO_POD=$(kubectl get pod -n falco -l app.kubernetes.io/name=falco -o jsonpath='{.items[0].metadata.name}')
+
+# Verify rule loading in pod logs
+kubectl logs -n falco $FALCO_POD -c falco | grep -i "rules loaded"
+```
+
+### Step 2: Trigger Falco Rules and Capture Alerts
+
+Stream the Falco output into /tmp/falco-alerts.txt in the background:
+
+```
+kubectl logs -n falco $FALCO_POD -c falco -f > /tmp/falco-alerts.txt &
+```
+
+Trigger the three required rules from inside compliant-pod in namespace cks-1:
+
+```
+# 1. Terminal shell in container
+kubectl exec -it -n cks-1 compliant-pod -- /bin/sh -c "exit"
+
+# 2. Read sensitive file
+kubectl exec -it -n cks-1 compliant-pod -- cat /etc/passwd
+
+# 3. Contact K8s API Server from container
+kubectl exec -it -n cks-1 compliant-pod -- curl -k https://kubernetes.default.svc
+```
+
+Verify that the events were captured in /tmp/falco-alerts.txt:
+
+```
+cat /tmp/falco-alerts.txt | grep -E "Terminal shell|sensitive file|K8s API"
+```
+
+### Step 3: Write Custom Falco Rule File
+
+Create /tmp/custom-rule.yaml on the host:
+
+```
+cat <<'EOF' > /tmp/custom-rule.yaml
+- rule: Netcat Executed in Container
+  desc: Detect any process named nc, ncat, or netcat running inside a container
+  condition: container.id != host and proc.name in (nc, ncat, netcat)
+  output: "Netcat process executed inside container (container_name=%container.name image=%container.image.repository process=%proc.name cmdline=%proc.cmdline)"
+  priority: CRITICAL
+  tags: [container, network, custom]
+EOF
+```
+
+### Step 4: Append Custom Rule and Force Falco Rule Reload
+
+Append /tmp/custom-rule.yaml directly to the active /etc/falco/falco_rules.yaml file inside the running container, then signal Falco to reload its rules engine:
+
+```
+# 1. Append custom rule to falco_rules.yaml
+kubectl exec -i -n falco $FALCO_POD -c falco -- sh -c 'cat >> /etc/falco/falco_rules.yaml' < /tmp/custom-rule.yaml
+
+# 2. Send SIGHUP (signal 1) to force Falco to reload the rule file
+kubectl exec -n falco $FALCO_POD -c falco -- kill -1 1
+```
+
+Alternative (if kill is restricted inside the container):
+
+```
+kubectl rollout restart daemonset falco -n falco
+```
+
+### Step 5: Verify Rule Reload and Test Execution
+
+- Verify rule reload in Falco logs:
+
+```
+# Re-fetch FALCO_POD name if a rollout restart was performed
+FALCO_POD=$(kubectl get pod -n falco -l app.kubernetes.io/name=falco -o jsonpath='{.items[0].metadata.name}')
+
+kubectl logs -n falco $FALCO_POD -c falco --tail=30
+```
+
+(Look for log confirming: Loading rules from: /etc/falco/falco_rules.yaml | schema validation: ok)
+
+- Trigger the rule with nc:
+
+```
+kubectl exec -it -n cks-1 compliant-pod -- nc -h
+```
+
+- Confirm the alert fired with CRITICAL priority:
+
+```
+kubectl logs -n falco $FALCO_POD -c falco | grep "Netcat process executed"
+```
+
 *************************************************************************************************************************************************************
 
 ## Task 4 — Image Security (7%)
