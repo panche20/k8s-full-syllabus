@@ -38,6 +38,132 @@ In namespace cks-1:
 - Create a Pod named violating-pod that would fail restricted — document exactly which fields cause the violation by writing them to /tmp/psa-violations.txt
 - Write the namespace labels to /tmp/psa-labels.txt
 
+**Solution:**
+
+## Step 1: Label the namespace
+
+```
+kubectl label ns cks-1 \
+pod-security.kubernetes.io/enforce=baseline \
+pod-security.kubernetes.io/enforce-version=latest \
+pod-security.kubernetes.io/warn=restricted \
+pod-security.kubernetes.io/warn-version=latest \
+pod-security.kubernetes.io/audit=restricted \
+pod-security.kubernetes.io/audit-version=latest \
+--overwrite
+```
+
+## Step 2: Create compliant-pod
+
+The pod must:
+
+- Pass baseline
+- Trigger restricted warning
+
+The easiest way is to omit all restricted security settings.
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: compliant-pod
+  namespace: cks-1
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+```
+
+**Apply it:**
+
+```
+kubectl apply -f compliant-pod.yaml
+```
+
+**You should see something similar to:**
+
+```
+Warning: would violate PodSecurity "restricted:latest":
+allowPrivilegeEscalation != false
+runAsNonRoot != true
+seccompProfile not set
+capabilities.drop not set
+```
+
+## Step 3: Create violating-pod
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: violating-pod
+  namespace: cks-1
+spec:
+  hostNetwork: true
+  containers:
+  - name: nginx
+    image: nginx:1.25
+    securityContext:
+      privileged: true
+```
+
+```
+kubectl apply -f violating-pod.yaml
+```
+
+## Step 4: Document the restricted violations
+
+```
+cat <<EOF >/tmp/psa-violations.txt
+privileged: true
+allowPrivilegeEscalation not set to false
+runAsNonRoot not set to true
+seccompProfile not set
+capabilities.drop not set
+EOF
+```
+
+## Step 5: Save namespace labels
+
+```
+kubectl get ns cks-1 --show-labels > /tmp/psa-labels.txt
+kubectl get ns cks-1 -o jsonpath='{.metadata.labels}' >/tmp/psa-labels.txt
+```
+
+**Verification**
+
+```
+kubectl get ns cks-1 --show-labels
+kubectl get pods -n cks-1
+kubectl describe pod compliant-pod -n cks-1
+```
+
+**Files required**
+
+*/tmp/psa-labels.txt*
+Contains namespace labels.
+*/tmp/psa-violations.txt*
+
+```
+privileged: true
+allowPrivilegeEscalation not set to false
+runAsNonRoot not set to true
+seccompProfile not set
+capabilities.drop not set
+```
+
+**CKS Exam Tip (Fastest Commands)**
+
+```
+kubectl label ns cks-1 \
+pod-security.kubernetes.io/enforce=baseline \
+pod-security.kubernetes.io/enforce-version=latest \
+pod-security.kubernetes.io/warn=restricted \
+pod-security.kubernetes.io/warn-version=latest \
+pod-security.kubernetes.io/audit=restricted \
+pod-security.kubernetes.io/audit-version=latest --overwrite
+```
+
 ## Task 2 — RBAC Hardening (7%)
 
 In namespace cks-2:
@@ -56,6 +182,104 @@ kubectl create clusterrolebinding over-privileged-binding \
   --clusterrole=cluster-admin \
   --serviceaccount=cks-2:over-privileged-sa
 ```
+
+**Solution**
+
+## Step 1: Execute Setup Script
+
+*First, run the provided setup commands to establish the starting environment:*
+
+```
+kubectl create namespace cks-2
+kubectl create serviceaccount over-privileged-sa -n cks-2
+kubectl create clusterrolebinding over-privileged-binding \
+  --clusterrole=cluster-admin \
+  --serviceaccount=cks-2:over-privileged-sa
+```
+
+## Step 2: Verify Initial Over-Privileged Access
+
+*Confirm that the ServiceAccount currently has cluster-wide administrative rights (e.g., ability to delete secrets):*
+
+```
+kubectl auth can-i delete secrets \
+  --as=system:serviceaccount:cks-2:over-privileged-sa \
+  -A
+```
+
+**Expected Output: yes**
+
+## Step 3: Remove Over-Privileged ClusterRoleBinding
+
+*Identify and delete the ClusterRoleBinding linking over-privileged-sa to cluster-admin:*
+
+```
+kubectl delete clusterrolebinding over-privileged-binding
+```
+
+## Step 4: Create Minimal Role app-role
+
+*Create the Role in namespace cks-2 granting permissions to get and list pods, as well as get pod logs:*
+
+```
+kubectl create role app-role \
+  --namespace=cks-2 \
+  --verb=get,list --resource=pods \
+  --verb=get --resource=pods/log
+```
+
+## Step 5: Bind ServiceAccount to app-role
+
+*Bind over-privileged-sa to app-role within namespace cks-2 using a RoleBinding:*
+
+```
+kubectl create rolebinding app-role-binding \
+  --namespace=cks-2 \
+  --role=app-role \
+  --serviceaccount=cks-2:over-privileged-sa
+```
+
+## Step 6: Verification
+
+**1. Verify secret deletion is blocked cluster-wide:**
+
+```
+kubectl auth can-i delete secrets \
+  --as=system:serviceaccount:cks-2:over-privileged-sa \
+  -A
+```
+**Expected Output: no**
+
+**2. Verify Pod access in cks-2 namespace:**
+
+```
+# Can list pods in cks-2
+kubectl auth can-i list pods \
+  --as=system:serviceaccount:cks-2:over-privileged-sa \
+  -n cks-2
+
+# Can get pod logs in cks-2
+kubectl auth can-i get pods/log \
+  --as=system:serviceaccount:cks-2:over-privileged-sa \
+  -n cks-2
+
+# Cannot delete pods in cks-2
+kubectl auth can-i delete pods \
+  --as=system:serviceaccount:cks-2:over-privileged-sa \
+  -n cks-2
+```
+
+**Expected Outputs: yes, yes, no**
+
+**3. Verify isolation outside cks-2:**
+
+```
+kubectl auth can-i list pods \
+  --as=system:serviceaccount:cks-2:over-privileged-sa \
+  -n default
+```
+
+**Expected Output: no**
 
 ## Task 3 — Falco Runtime Detection (8%)
 
