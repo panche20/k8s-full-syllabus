@@ -409,6 +409,7 @@ kubectl logs -n falco $FALCO_POD -c falco | grep "Netcat process executed"
 - Scan your cluster's running workloads — write the namespace and deployment names that have HIGH or CRITICAL CVEs to /tmp/cluster-vulns.txt
 - Create an OPA Gatekeeper ConstraintTemplate that blocks pods using images from any registry other than ghcr.io and registry.k8s.io
 
+**Solution**
 *************************************************************************************************************************************************************
 
 ## Task 5 — Seccomp Profiles (6%)
