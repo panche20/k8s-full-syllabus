@@ -771,7 +771,7 @@ kubectl get secrets -A -o json \
     "\(.metadata.namespace)/\(.metadata.name)"'
 ```
 
-## 🎯 Part 7: Interview Questions — Day 18
+## 🎯 Part 7: Interview Questions — Day 15
 
 **Q1: Sealed Secrets vs External Secrets Operator — when do you use each?**
 
