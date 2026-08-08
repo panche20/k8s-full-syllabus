@@ -164,6 +164,8 @@ pod-security.kubernetes.io/audit=restricted \
 pod-security.kubernetes.io/audit-version=latest --overwrite
 ```
 
+*************************************************************************************************************************************************************
+
 ## Task 2 — RBAC Hardening (7%)
 
 In namespace cks-2:
@@ -281,6 +283,8 @@ kubectl auth can-i list pods \
 
 **Expected Output: no**
 
+*************************************************************************************************************************************************************
+
 ## Task 3 — Falco Runtime Detection (8%)
 
 Falco is running on your cluster.
@@ -296,6 +300,8 @@ Falco is running on your cluster.
     - Output includes: container name, image, process name, command line
 - Apply the custom rule to Falco and prove it fires when you run nc inside a pod
 
+*************************************************************************************************************************************************************
+
 ## Task 4 — Image Security (7%)
 
 - Scan the image nginx:1.20 with Trivy — write CRITICAL and HIGH CVEs only to /tmp/nginx-120-cves.txt
@@ -303,6 +309,8 @@ Falco is running on your cluster.
 - Find which image has fewer HIGH+CRITICAL CVEs — write the answer and count to /tmp/safer-image.txt
 - Scan your cluster's running workloads — write the namespace and deployment names that have HIGH or CRITICAL CVEs to /tmp/cluster-vulns.txt
 - Create an OPA Gatekeeper ConstraintTemplate that blocks pods using images from any registry other than ghcr.io and registry.k8s.io
+
+*************************************************************************************************************************************************************
 
 ## Task 5 — Seccomp Profiles (6%)
 
@@ -313,6 +321,8 @@ Falco is running on your cluster.
     - Which syscalls RuntimeDefault blocks that Unconfined allows
     - The security implication of using Unconfined
 - From inside seccomp-default, try to run unshare --pid echo test — write the result to /tmp/seccomp-block.txt
+
+*************************************************************************************************************************************************************
 
 ## Task 6 — Network Policy Hardening (8%)
 
@@ -346,6 +356,8 @@ Verify the full matrix:
 
 Write your verification commands and results to */tmp/netpol-verify.txt*
 
+*************************************************************************************************************************************************************
+
 ## Task 7 — Pod Hardening (7%)
 
 *In namespace cks-7, create a Pod hardened-app with image nginx:1.25 that meets ALL of these requirements:*
@@ -365,6 +377,8 @@ Write your verification commands and results to */tmp/netpol-verify.txt*
 Write the pod YAML to */tmp/hardened-pod.yaml* and apply it.
 Verify it is Running and passes the readiness probe.
 
+*************************************************************************************************************************************************************
+
 ## Task 8 — OPA Gatekeeper Policy (8%)
 
 Install Gatekeeper if not already installed.
@@ -382,6 +396,8 @@ Test each policy:
 - For Policy 3: try creating a Pod with no resource limits → should fail
 
 Write each policy violation message to */tmp/gatekeeper-violations.txt*
+
+*************************************************************************************************************************************************************
 
 ## Task 9 — Secrets Security (6%)
 
@@ -416,6 +432,8 @@ spec:
 EOF
 ```
 
+*************************************************************************************************************************************************************
+
 ## Task 10 — Cluster Hardening: API Server (7%)
 
 Examine the kube-apiserver configuration and:
@@ -426,6 +444,8 @@ Examine the kube-apiserver configuration and:
 - Enable the NodeRestriction admission plugin if not already enabled
 - Disable the AlwaysAdmit plugin if present
 - Write the before and after admission plugin list to /tmp/admission-changes.txt
+
+*************************************************************************************************************************************************************
 
 ## Task 11 — Audit Logging (7%)
 
@@ -444,6 +464,8 @@ Configure audit logging on the API server:
 - Verify: create and read a Secret — confirm it appears in the audit log
 - Write 3 audit log entries (formatted) to /tmp/audit-entries.txt
 
+*************************************************************************************************************************************************************
+
 ## Task 12 — Supply Chain: Image Verification (6%)
 
 - Install cosign on your EC2 instance
@@ -452,6 +474,8 @@ Configure audit logging on the API server:
 - Verify the signature
 - Create a Kyverno or Gatekeeper policy that would enforce image signature verification for namespace cks-12
 - Write the policy YAML to /tmp/image-signing-policy.yaml
+
+*************************************************************************************************************************************************************
 
 ## Task 13 — Trivy Operator — Continuous Scanning (6%)
 
@@ -474,6 +498,8 @@ helm install trivy-operator aquasecurity/trivy-operator \
 kubectl get vulnerabilityreports -A
 kubectl get configauditreports -A
 ```
+
+*************************************************************************************************************************************************************
 
 ## Task 14 — Runtime Security: Restrict a Compromised Pod (8%)
 
@@ -514,6 +540,8 @@ Your tasks — respond to the incident:
     - What you isolated
     - What you hardened
     - What you would do next (Falco rule, image scan, replace image)
+
+*************************************************************************************************************************************************************
 
 ## Task 15 — CKS Synthesis: Secure a Full Namespace (7%)
 
