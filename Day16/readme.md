@@ -40,7 +40,7 @@ In namespace cks-1:
 
 **Solution:**
 
-## Step 1: Label the namespace
+### Step 1: Label the namespace
 
 ```
 kubectl label ns cks-1 \
@@ -53,7 +53,7 @@ pod-security.kubernetes.io/audit-version=latest \
 --overwrite
 ```
 
-## Step 2: Create compliant-pod
+### Step 2: Create compliant-pod
 
 The pod must:
 
@@ -90,7 +90,7 @@ seccompProfile not set
 capabilities.drop not set
 ```
 
-## Step 3: Create violating-pod
+### Step 3: Create violating-pod
 
 ```
 apiVersion: v1
@@ -111,7 +111,7 @@ spec:
 kubectl apply -f violating-pod.yaml
 ```
 
-## Step 4: Document the restricted violations
+### Step 4: Document the restricted violations
 
 ```
 cat <<EOF >/tmp/psa-violations.txt
@@ -123,7 +123,7 @@ capabilities.drop not set
 EOF
 ```
 
-## Step 5: Save namespace labels
+### Step 5: Save namespace labels
 
 ```
 kubectl get ns cks-1 --show-labels > /tmp/psa-labels.txt
@@ -185,7 +185,7 @@ kubectl create clusterrolebinding over-privileged-binding \
 
 **Solution**
 
-## Step 1: Execute Setup Script
+### Step 1: Execute Setup Script
 
 *First, run the provided setup commands to establish the starting environment:*
 
@@ -197,7 +197,7 @@ kubectl create clusterrolebinding over-privileged-binding \
   --serviceaccount=cks-2:over-privileged-sa
 ```
 
-## Step 2: Verify Initial Over-Privileged Access
+### Step 2: Verify Initial Over-Privileged Access
 
 *Confirm that the ServiceAccount currently has cluster-wide administrative rights (e.g., ability to delete secrets):*
 
@@ -209,7 +209,7 @@ kubectl auth can-i delete secrets \
 
 **Expected Output: yes**
 
-## Step 3: Remove Over-Privileged ClusterRoleBinding
+### Step 3: Remove Over-Privileged ClusterRoleBinding
 
 *Identify and delete the ClusterRoleBinding linking over-privileged-sa to cluster-admin:*
 
@@ -217,7 +217,7 @@ kubectl auth can-i delete secrets \
 kubectl delete clusterrolebinding over-privileged-binding
 ```
 
-## Step 4: Create Minimal Role app-role
+### Step 4: Create Minimal Role app-role
 
 *Create the Role in namespace cks-2 granting permissions to get and list pods, as well as get pod logs:*
 
@@ -228,7 +228,7 @@ kubectl create role app-role \
   --verb=get --resource=pods/log
 ```
 
-## Step 5: Bind ServiceAccount to app-role
+### Step 5: Bind ServiceAccount to app-role
 
 *Bind over-privileged-sa to app-role within namespace cks-2 using a RoleBinding:*
 
@@ -239,7 +239,7 @@ kubectl create rolebinding app-role-binding \
   --serviceaccount=cks-2:over-privileged-sa
 ```
 
-## Step 6: Verification
+### Step 6: Verification
 
 **1. Verify secret deletion is blocked cluster-wide:**
 
