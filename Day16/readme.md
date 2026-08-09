@@ -410,6 +410,148 @@ kubectl logs -n falco $FALCO_POD -c falco | grep "Netcat process executed"
 - Create an OPA Gatekeeper ConstraintTemplate that blocks pods using images from any registry other than ghcr.io and registry.k8s.io
 
 **Solution**
+
+### Step 1: Scan nginx:1.20 for HIGH and CRITICAL CVEs
+
+*Use Trivy's --severity flag to filter for HIGH,CRITICAL severity levels and redirect the output:*
+
+```
+trivy image --severity HIGH,CRITICAL nginx:1.20 > /tmp/nginx-120-cves.txt
+```
+
+### Step 2: Scan nginx:1.25 for Summary Output
+
+*By default, standard trivy image includes the vulnerability summary table. To generate the summary file:*
+
+```
+trivy image nginx:1.25 > /tmp/nginx-125-summary.txt
+```
+
+### Step 3: Compare Vulnerabilities and Write Comparison Result
+
+*Count the total HIGH and CRITICAL vulnerabilities for both images using Trivy's quiet/json or filtered output:*
+
+```
+# Count HIGH + CRITICAL for 1.20
+trivy image --severity HIGH,CRITICAL nginx:1.20 --quiet | grep -E "HIGH|CRITICAL" | wc -l
+
+# Count HIGH + CRITICAL for 1.25
+trivy image --severity HIGH,CRITICAL nginx:1.25 --quiet | grep -E "HIGH|CRITICAL" | wc -l
+```
+
+Assuming nginx:1.25 has fewer vulnerabilities (since it is newer):
+
+```
+cat <<EOF > /tmp/safer-image.txt
+Image: nginx:1.25
+Count: <insert_counted_number>
+EOF
+```
+
+### Step 4: Scan Running Cluster Workloads
+
+*Scan the container images deployed across your running pods using Trivy, or fetch running pod images directly using kubectl and scan them:*
+
+```
+# Clear file if present
+> /tmp/cluster-vulns.txt
+
+# Iterate over running pods, extract image, and scan
+kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.containers[0].image}{"\n"}{end}' | while read -r ns pod img; do
+  
+  # Scan image and count HIGH/CRITICAL CVEs
+  vuln_count=$(trivy image --severity HIGH,CRITICAL --quiet "$img" 2>/dev/null | grep -c -E "HIGH|CRITICAL")
+  
+  if [ "$vuln_count" -gt 0 ]; then
+    echo "Namespace: $ns | Workload/Pod: $pod" >> /tmp/cluster-vulns.txt
+  fi
+done
+```
+
+### Step 5: OPA Gatekeeper ConstraintTemplate & Constraint
+
+Gatekeeper requires two resources: a ConstraintTemplate (defining the Rego logic) and a Constraint (specifying parameters and enforcement scope).
+
+**1. Create the ConstraintTemplate**
+
+Apply this manifest to allow only images starting with ghcr.io/ or registry.k8s.io/:
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sallowedrepos
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sAllowedRepos
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            repos:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sallowedrepos
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not valid_image(container.image)
+          msg := sprintf("container <%v> has an invalid image registry <%v>, allowed registries are %v", [container.name, container.image, input.parameters.repos])
+        }
+
+        valid_image(image) {
+          repo := input.parameters.repos[_]
+          startswith(image, repo)
+        }
+EOF
+```
+
+**2. Create the Constraint**
+
+Enforce the rule across all Pods in the cluster:
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sAllowedRepos
+metadata:
+  name: allow-specified-registries
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    repos:
+      - "ghcr.io/"
+      - "registry.k8s.io/"
+EOF
+```
+
+**Step 3: Verify Test Pod Creation**
+Test Allowed Pod (Should Pass):
+
+```
+kubectl run test-allowed-pod --image=registry.k8s.io/pause:3.9 --restart=Never
+```
+
+Test Blocked Pod (Should Fail):
+```
+kubectl run test-blocked-pod --image=nginx:latest --restart=Never
+```
+
+Clean Up:
+
+```
+kubectl delete pod test-allowed-pod --ignore-not-found
+```
 *************************************************************************************************************************************************************
 
 ## Task 5 — Seccomp Profiles (6%)
