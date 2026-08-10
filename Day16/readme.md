@@ -564,6 +564,96 @@ kubectl delete pod test-allowed-pod --ignore-not-found
     - The security implication of using Unconfined
 - From inside seccomp-default, try to run unshare --pid echo test — write the result to /tmp/seccomp-block.txt
 
+**Solution**
+
+### Step 1: Create Namespace and Verify Seccomp Availability
+
+*Seccomp support is enabled in Linux kernels 3.5+ and built into containerd/cri-o by default. Verify seccomp is supported on your node kernel:*
+
+```
+# Create namespace cks-5
+kubectl create namespace cks-5
+
+# Verify kernel has seccomp enabled (should return CONFIG_SECCOMP=y)
+grep CONFIG_SECCOMP= /boot/config-$(uname -r)
+```
+
+### Step 2: Create Pod seccomp-default (RuntimeDefault Profile)
+
+*Create a pod in namespace cks-5 with securityContext.seccompProfile.type: RuntimeDefault:*
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: seccomp-default
+  namespace: cks-5
+spec:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: busybox
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+EOF
+```
+
+### Step 3: Create Pod seccomp-unconfined (Unconfined Profile)
+
+*Create a pod in namespace cks-5 with securityContext.seccompProfile.type: Unconfined:*
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: seccomp-unconfined
+  namespace: cks-5
+spec:
+  securityContext:
+    seccompProfile:
+      type: Unconfined
+  containers:
+    - name: busybox
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+EOF
+```
+
+### Step 4: Write Diff and Security Implication to /tmp/seccomp-diff.txt
+
+*Create the file explaining blocked syscalls and the security risks of Unconfined:*
+
+```
+cat <<'EOF' > /tmp/seccomp-diff.txt
+Syscalls blocked by RuntimeDefault but allowed by Unconfined:
+RuntimeDefault blocks dangerous system calls including unshare, ptrace, reboot, kexec_load, acct, add_key, bpf, io_pgetevents, sysfs, and personality.
+
+Security implication of using Unconfined:
+Using Unconfined disables all kernel syscall filtering for the container. If a container is compromised, an attacker can execute sensitive kernel syscalls to perform container escape, access host memory/processes, load kernel modules, or disrupt the host kernel and neighboring pods.
+EOF
+```
+
+### Step 5: Test unshare Inside seccomp-default and Capture Output
+
+*Execute unshare inside seccomp-default. Because RuntimeDefault filters out the unshare syscall, the system will reject the request (Operation not permitted):*
+
+```
+kubectl exec -n cks-5 seccomp-default -- unshare --pid echo test > /tmp/seccomp-block.txt 2>&1
+```
+
+### Verification
+
+*Verify both files were written correctly:*
+
+```
+cat /tmp/seccomp-diff.txt
+echo "---"
+cat /tmp/seccomp-block.txt
+```
+
 *************************************************************************************************************************************************************
 
 ## Task 6 — Network Policy Hardening (8%)
@@ -597,6 +687,10 @@ Verify the full matrix:
 - external pod → database: ❌
 
 Write your verification commands and results to */tmp/netpol-verify.txt*
+
+**Solution**
+
+
 
 *************************************************************************************************************************************************************
 
