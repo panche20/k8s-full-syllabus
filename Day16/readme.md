@@ -1051,6 +1051,285 @@ Test each policy:
 
 Write each policy violation message to */tmp/gatekeeper-violations.txt*
 
+**Solution**
+
+### Step 1: Install Gatekeeper (if not already installed)
+
+```
+kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/master/deploy/gatekeeper.yaml
+```
+
+### Policy 1: K8sRequiredLabels
+
+**ConstraintTemplate**
+
+```
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels:
+              type: array
+              items:
+                type: string
+  targets:
+  - target: admission.k8s.gatekeeper.sh
+    rego: |
+      package k8srequiredlabels
+
+      violation[{"msg": msg}] {
+        required := input.parameters.labels[_]
+        not input.review.object.metadata.labels[required]
+        msg := sprintf("Missing required label: %v", [required])
+      }
+```
+
+**Apply**::
+
+```
+kubectl apply -f required-labels-template.yaml
+```
+
+**Constraint**
+
+```
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: deployment-required-labels
+spec:
+  match:
+    kinds:
+    - apiGroups: ["apps"]
+      kinds: ["Deployment"]
+    namespaces:
+    - cks-8
+  parameters:
+    labels:
+    - team
+    - environment
+```
+
+**Apply:**
+
+```
+kubectl apply -f required-labels-constraint.yaml
+```
+
+### Policy 2: K8sNoLatestTag
+
+**ConstraintTemplate**
+
+```
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8snolatesttag
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sNoLatestTag
+  targets:
+  - target: admission.k8s.gatekeeper.sh
+    rego: |
+      package k8snolatesttag
+
+      violation[{"msg": msg}] {
+        container := input.review.object.spec.containers[_]
+        endswith(container.image, ":latest")
+        msg := sprintf("Image %v uses latest tag", [container.image])
+      }
+
+      violation[{"msg": msg}] {
+        container := input.review.object.spec.containers[_]
+        not contains(container.image, ":")
+        msg := sprintf("Image %v has no explicit tag", [container.image])
+      }
+```
+
+**Apply**
+
+```
+kubectl apply -f no-latest-template.yaml
+```
+
+**Constraint**
+
+```
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sNoLatestTag
+metadata:
+  name: deny-latest
+spec:
+  match:
+    kinds:
+    - apiGroups: [""]
+      kinds: ["Pod"]
+```
+
+### Policy 3: K8sRequiredResources
+
+**ConstraintTemplate**
+
+```
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredresources
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredResources
+  targets:
+  - target: admission.k8s.gatekeeper.sh
+    rego: |
+      package k8srequiredresources
+
+      violation[{"msg": msg}] {
+        container := input.review.object.spec.containers[_]
+        not container.resources.limits.cpu
+        msg := sprintf("Container %v missing CPU limit", [container.name])
+      }
+
+      violation[{"msg": msg}] {
+        container := input.review.object.spec.containers[_]
+        not container.resources.limits.memory
+        msg := sprintf("Container %v missing memory limit", [container.name])
+      }
+```
+
+**Apply**
+
+```
+kubectl apply -f required-resources-template.yaml
+```
+
+**Constraint**
+
+```
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredResources
+metadata:
+  name: require-limits
+spec:
+  match:
+    kinds:
+    - apiGroups: [""]
+      kinds: ["Pod"]
+```
+
+### Testing
+
+**Test Policy 1**
+
+```
+kubectl create ns cks-8
+```
+
+```
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: cks-8
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+```
+
+**Expected**
+
+```
+Missing required label: team
+Missing required label: environment
+```
+
+### Test Policy 2
+
+```
+kubectl run test --image=nginx
+```
+
+**Expected**
+
+```
+Image nginx has no explicit tag
+
+or
+
+Image nginx:latest uses latest tag
+```
+
+### Test Policy 3
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: no-limits
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+```
+
+**Expected**
+
+```
+Container nginx missing CPU limit
+Container nginx missing memory limit
+```
+
+**Save Violations**
+
+```
+cat <<EOF >/tmp/gatekeeper-violations.txt
+Policy 1:
+Missing required label: team
+Missing required label: environment
+
+Policy 2:
+Image nginx has no explicit tag
+
+Policy 3:
+Container nginx missing CPU limit
+Container nginx missing memory limit
+EOF
+```
+
+### CKS Exam Tips
+
+- A Gatekeeper policy requires both a ConstraintTemplate (defines the Rego logic) and a Constraint (enforces it). Missing either means the policy won't be applied.
+- kubectl run --image=nginx uses the image nginx with no explicit tag, which implicitly resolves to :latest. Your policy should reject both images with an explicit :latest tag and images without any tag.
+- Resource policies should check the container's resources.limits fields. If the task asks for requests as well, add corresponding checks for resources.requests.cpu and resources.requests.memory.
+- After applying each template and constraint, verify they're active with:
+
+```
+kubectl get constrainttemplates
+kubectl get constraints
+```
+
 *************************************************************************************************************************************************************
 
 ## Task 9 — Secrets Security (6%)
