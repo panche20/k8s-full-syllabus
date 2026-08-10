@@ -1365,6 +1365,149 @@ spec:
 EOF
 ```
 
+**Solution**
+
+### Step 1: Run Setup
+
+*Run the setup commands to create namespace cks-9, the secret, and the consumer pod:*
+
+```
+kubectl create namespace cks-9
+
+kubectl create secret generic exposed-secret \
+  --from-literal=API_KEY=leaked_key_123 -n cks-9
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secret-consumer
+  namespace: cks-9
+spec:
+  containers:
+  - name: app
+    image: nginx:1.25
+    env:
+    - name: API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: exposed-secret
+          key: API_KEY
+EOF
+```
+
+### Step 2: Find Secrets Mounted as Environment Variables
+
+*Extract secret names referenced in container environment variables (env[*].valueFrom.secretKeyRef.name or envFrom[*].secretRef.name) across pods in cks-9:*
+
+```
+kubectl get pods -n cks-9 -o jsonpath='{range .items[*].spec.containers[*]}{.env[*].valueFrom.secretKeyRef.name}{" "}{.envFrom[*].secretRef.name}{"\n"}{end}' | tr ' ' '\n' | grep -v '^$' | sort -u > /tmp/env-secrets.txt
+```
+
+**Verify Output:**
+
+```
+cat /tmp/env-secrets.txt
+```
+
+**Expected output: exposed-secret**
+
+### Step 3: Explain Volume Mount Security vs Environment Variables
+
+*Write the security explanation to /tmp/secret-security.txt:*
+
+```
+cat <<'EOF' > /tmp/secret-security.txt
+Why volume mounts are more secure than environment variables for Secrets:
+
+1. Process Visibility & Leakage: Environment variables are accessible to all child processes spawned inside the container and can easily leak through application error logs, crash dumps, system monitoring tools, or inspection of `/proc/1/environ`.
+2. Dynamic Updates: Secrets mounted as volumes are updated automatically by K8s when the Secret resource changes (without restarting the container), whereas environment variables remain static after container startup.
+3. Memory Storage (tmpfs): Mounted Secrets reside in `tmpfs` (RAM-backed memory file systems), ensuring secret payload data is never written to disk storage on the worker node.
+EOF
+```
+
+### Step 4: Verify ETCD Encryption Configuration
+
+*Check if kube-apiserver is configured with the --encryption-provider-config flag:*
+
+```
+if sudo grep -q "\--encryption-provider-config" /etc/kubernetes/manifests/kube-apiserver.yaml; then
+  echo "ETCD Encryption Status: Configured" | sudo tee /tmp/etcd-encryption.txt
+  sudo grep "\--encryption-provider-config" /etc/kubernetes/manifests/kube-apiserver.yaml | sudo tee -a /tmp/etcd-encryption.txt
+else
+  echo "ETCD Encryption Status: NOT Configured" | sudo tee /tmp/etcd-encryption.txt
+fi
+```
+
+**Verify Output**
+
+Check the contents of the generated status file:
+
+```
+cat /tmp/etcd-encryption.txt
+```
+
+**Expected Output (Default kubeadm install):**
+
+```
+ETCD Encryption Status: NOT Configured
+```
+
+### Step 5: Create Secret secure-secret
+
+*Create the Secret in namespace cks-9:*
+
+```
+kubectl create secret generic secure-secret \
+  --from-literal=PASSWORD=TopSecret123 \
+  -n cks-9
+```
+
+### Step 6: Verify Accessibility in Pod vs Direct ETCD Read
+
+**1. Verify Pod Access**
+
+*Deploy a pod mounting secure-secret as a volume to confirm the workload can read it:*
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-reader
+  namespace: cks-9
+spec:
+  containers:
+  - name: app
+    image: nginx:1.25
+    volumeMounts:
+    - name: secret-vol
+      mountPath: /etc/secrets
+      readOnly: true
+  volumes:
+  - name: secret-vol
+    secret:
+      secretName: secure-secret
+EOF
+
+# Wait for pod to start and verify value
+kubectl exec -n cks-9 secure-reader -- cat /etc/secrets/PASSWORD
+```
+
+**Expected Output: TopSecret123**
+
+**2. Verify Direct ETCD Read (Plain Text Check)**
+
+*Run etcdctl directly against the etcd datastore on the control plane node:*
+
+```
+sudo ETCDCTL_API=3 etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry/secrets/cks-9/secure-secret
+```
+
 *************************************************************************************************************************************************************
 
 ## Task 10 — Cluster Hardening: API Server (7%)
@@ -1377,6 +1520,10 @@ Examine the kube-apiserver configuration and:
 - Enable the NodeRestriction admission plugin if not already enabled
 - Disable the AlwaysAdmit plugin if present
 - Write the before and after admission plugin list to /tmp/admission-changes.txt
+
+**Solution**
+
+
 
 *************************************************************************************************************************************************************
 
