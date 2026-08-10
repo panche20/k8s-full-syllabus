@@ -690,7 +690,213 @@ Write your verification commands and results to */tmp/netpol-verify.txt*
 
 **Solution**
 
+### Step 1: Deploy Application Workloads
 
+*Run these commands to delete any modified or broken resources and deploy a clean 3-tier setup:*
+
+```
+# Create namespace
+kubectl create namespace cks-6
+
+# Deploy pods with required labels
+kubectl run frontend --image=nginx:1.25 --labels="tier=frontend" -n cks-6
+kubectl run backend  --image=nginx:1.25 --labels="tier=backend"  -n cks-6
+kubectl run database --image=nginx:1.25 --labels="tier=database" -n cks-6
+
+# Expose services on port 80
+kubectl expose pod frontend --port=80 -n cks-6
+kubectl expose pod backend  --port=80 -n cks-6
+kubectl expose pod database --port=80 -n cks-6
+```
+
+### Step 2: Apply All NetworkPolicies in One Manifest
+
+**This single manifest defines:**
+
+- default-deny-all: Blocks all traffic by default in cks-6.
+- frontend-netpol: Ingress from anywhere; Egress to backend (port 80) + DNS (port 53).
+- backend-netpol: Ingress from frontend (port 80); Egress to database (port 80) + DNS (port 53).
+- database-netpol: Ingress from backend (port 80); Egress to DNS (port 53).
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: cks-6
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-netpol
+  namespace: cks-6
+spec:
+  podSelector:
+    matchLabels:
+      tier: frontend
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - {}
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          tier: backend
+    ports:
+    - protocol: TCP
+      port: 80
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-netpol
+  namespace: cks-6
+spec:
+  podSelector:
+    matchLabels:
+      tier: backend
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: frontend
+    ports:
+    - protocol: TCP
+      port: 80
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          tier: database
+    ports:
+    - protocol: TCP
+      port: 80
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: database-netpol
+  namespace: cks-6
+spec:
+  podSelector:
+    matchLabels:
+      tier: database
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: backend
+    ports:
+    - protocol: TCP
+      port: 80
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+EOF
+```
+
+### Step 3: Verify the Matrix & Generate Output File
+
+*Run the test matrix script using curl (targeting specific container instances to avoid ephemeral pod interference):*
+
+```
+# Clear existing verification file
+> /tmp/netpol-verify.txt
+
+echo "=== NetworkPolicy Verification Matrix ===" >> /tmp/netpol-verify.txt
+
+# 1. frontend -> backend (Allowed)
+kubectl exec -n cks-6 frontend -c frontend -- curl -s --connect-timeout 2 http://backend >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+  echo "frontend -> backend: SUCCESS (Allowed)" >> /tmp/netpol-verify.txt
+else
+  echo "frontend -> backend: FAILED" >> /tmp/netpol-verify.txt
+fi
+
+# 2. backend -> database (Allowed)
+kubectl exec -n cks-6 backend -c backend -- curl -s --connect-timeout 2 http://database >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+  echo "backend -> database: SUCCESS (Allowed)" >> /tmp/netpol-verify.txt
+else
+  echo "backend -> database: FAILED" >> /tmp/netpol-verify.txt
+fi
+
+# 3. frontend -> database (Blocked)
+kubectl exec -n cks-6 frontend -c frontend -- curl -s --connect-timeout 2 http://database >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+  echo "frontend -> database: SUCCESS (Blocked)" >> /tmp/netpol-verify.txt
+else
+  echo "frontend -> database: FAILED" >> /tmp/netpol-verify.txt
+fi
+
+# 4. database -> backend (Blocked)
+kubectl exec -n cks-6 database -c database -- curl -s --connect-timeout 2 http://backend >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+  echo "database -> backend: SUCCESS (Blocked)" >> /tmp/netpol-verify.txt
+else
+  echo "database -> backend: FAILED" >> /tmp/netpol-verify.txt
+fi
+
+# 5. external pod -> database (Blocked)
+kubectl run test-ext --image=nginx:1.25 -n default --rm -i --restart=Never -- curl -s --connect-timeout 2 http://database.cks-6 >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+  echo "external pod -> database: SUCCESS (Blocked)" >> /tmp/netpol-verify.txt
+else
+  echo "external pod -> database: FAILED" >> /tmp/netpol-verify.txt
+fi
+```
+
+### Step 4: Validate Final Output
+
+*Print the contents of /tmp/netpol-verify.txt:*
+
+```
+cat /tmp/netpol-verify.txt
+```
+
+**Expected Output:**
+
+```
+=== NetworkPolicy Verification Matrix ===
+frontend -> backend: SUCCESS (Allowed)
+backend -> database: SUCCESS (Allowed)
+frontend -> database: SUCCESS (Blocked)
+database -> backend: SUCCESS (Blocked)
+external pod -> database: SUCCESS (Blocked)
+```
 
 *************************************************************************************************************************************************************
 
@@ -712,6 +918,118 @@ Write your verification commands and results to */tmp/netpol-verify.txt*
 
 Write the pod YAML to */tmp/hardened-pod.yaml* and apply it.
 Verify it is Running and passes the readiness probe.
+
+**Solution**
+
+### Step 1: Create namespace
+
+```
+kubectl create ns cks-7
+```
+
+### Step 2: Create a ConfigMap
+
+*Create a custom nginx configuration:*
+
+```
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: cks-7
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        server_name localhost;
+
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+        }
+    }
+```
+
+### Step 3: Create POD
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hardened-app
+  namespace: cks-7
+spec:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+
+  containers:
+  - name: nginx
+    image: nginx:1.25
+
+    command:
+    - nginx
+    - -g
+    - daemon off;
+
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 101
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+
+      capabilities:
+        drop:
+        - ALL
+        add:
+        - NET_BIND_SERVICE
+
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "64Mi"
+      limits:
+        cpu: "200m"
+        memory: "128Mi"
+
+    ports:
+    - containerPort: 8080
+
+    readinessProbe:
+      httpGet:
+        path: /
+        port: 8080
+      initialDelaySeconds: 5
+
+    volumeMounts:
+    - name: tmp
+      mountPath: /tmp
+
+    - name: cache
+      mountPath: /var/cache/nginx
+
+    - name: run
+      mountPath: /var/run
+
+    - name: nginx-config
+      mountPath: /etc/nginx/conf.d/default.conf
+      subPath: default.conf
+      readOnly: true
+
+  volumes:
+  - name: tmp
+    emptyDir: {}
+
+  - name: cache
+    emptyDir: {}
+
+  - name: run
+    emptyDir: {}
+
+  - name: nginx-config
+    configMap:
+      name: nginx-config
+```
 
 *************************************************************************************************************************************************************
 
