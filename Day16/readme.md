@@ -1523,7 +1523,167 @@ Examine the kube-apiserver configuration and:
 
 **Solution**
 
+### Step 1: Find the API Server manifest
 
+```
+sudo cat /etc/kubernetes/manifests/kube-apiserver.yaml
+
+or search for the relevant flags
+
+sudo grep -E "enable-admission-plugins|disable-admission-plugins|anonymous-auth|authorization-mode" \
+/etc/kubernetes/manifests/kube-apiserver.yaml
+```
+
+### Step 2: Save the enabled admission plugins
+
+*Extract the value of --enable-admission-plugins:*
+
+```
+grep enable-admission-plugins /etc/kubernetes/manifests/kube-apiserver.yaml \
+| sed 's/.*=//' \
+| tr ',' '\n' \
+> /tmp/admission-plugins.txt
+
+Verify:
+
+cat /tmp/admission-plugins.txt
+```
+
+### Step 3: Verify --anonymous-auth
+
+```
+grep anonymous-auth \
+/etc/kubernetes/manifests/kube-apiserver.yaml \
+> /tmp/anonymous-auth.txt
+
+Typical secure value:
+
+--anonymous-auth=false
+```
+
+*If the flag is missing, note that in recent Kubernetes versions the default is false, but for an exam you should report what is actually configured.*
+
+### Step 4: Verify Authorization Mode
+
+```
+grep authorization-mode \
+/etc/kubernetes/manifests/kube-apiserver.yaml \
+> /tmp/authz-mode.txt
+
+A secure configuration should include:
+
+--authorization-mode=Node,RBAC
+
+OR
+
+--authorization-mode=Node,RBAC,...
+```
+
+*Both Node and RBAC should be present.*
+
+### Step 5: Record the current admission plugin list
+
+```
+grep enable-admission-plugins \
+/etc/kubernetes/manifests/kube-apiserver.yaml \
+> /tmp/admission-changes.txt
+```
+
+### Step 6: Edit the API Server manifest
+
+*Open the manifest:*
+
+```
+sudo vi /etc/kubernetes/manifests/kube-apiserver.yaml
+
+Find something similar to:
+
+- --enable-admission-plugins=NamespaceLifecycle,LimitRanger,ServiceAccount,...
+```
+
+**Ensure NodeRestriction is included**
+
+Example:
+
+```
+--enable-admission-plugins=NamespaceLifecycle,LimitRanger,ServiceAccount,NodeRestriction,...
+```
+
+*If it's already present, don't add it again.*
+
+**Disable AlwaysAdmit if present**
+
+*Older Kubernetes versions supported AlwaysAdmit, but it has been removed for many releases. If you see it:*
+
+```
+--enable-admission-plugins=...,AlwaysAdmit,...
+
+remove it. If you instead find:
+
+--disable-admission-plugins=...
+```
+
+*ensure AlwaysAdmit is not enabled anywhere. On modern kubeadm clusters you typically won't see it at all.*
+
+### Step 7: Save the updated plugin list
+
+*Append the updated configuration:*
+
+```
+echo "----- AFTER -----" >> /tmp/admission-changes.txt
+
+grep enable-admission-plugins \
+/etc/kubernetes/manifests/kube-apiserver.yaml \
+>> /tmp/admission-changes.txt
+
+Verify:
+
+cat /tmp/admission-changes.txt
+```
+
+### Step 8: Wait for the API Server to restart
+
+**Because it's a static Pod, the kubelet will restart it automatically.**
+
+*Watch the API server:*
+
+```
+kubectl get pods -n kube-system -w | grep kube-apiserver
+
+or simply wait until:
+
+kubectl get nodes
+```
+
+**Quick verification**
+
+*Check that NodeRestriction is present:*
+
+```
+grep enable-admission-plugins \
+/etc/kubernetes/manifests/kube-apiserver.yaml
+
+Check the API server is healthy:
+
+kubectl get componentstatuses
+
+or, on newer Kubernetes versions where ComponentStatus is deprecated:
+kubectl get --raw /readyz
+Expected : OK
+```
+
+**CKS Exam Tips**
+
+- Do not edit the running Pod. Always edit the static manifest at /etc/kubernetes/manifests/kube-apiserver.yaml.
+- The kubelet automatically recreates the API server after the file changes—no systemctl restart is needed.
+- NodeRestriction is a recommended admission plugin and is enabled by default in many recent kubeadm clusters.
+- AlwaysAdmit is obsolete and is usually absent on current Kubernetes releases. If your cluster is recent (such as v1.33), you'll likely find nothing to remove.
+- Before modifying the manifest, it's good practice to back it up:
+
+```
+sudo cp /etc/kubernetes/manifests/kube-apiserver.yaml \
+/etc/kubernetes/manifests/kube-apiserver.yaml.bak
+```
 
 *************************************************************************************************************************************************************
 
@@ -1544,6 +1704,118 @@ Configure audit logging on the API server:
 - Verify: create and read a Secret — confirm it appears in the audit log
 - Write 3 audit log entries (formatted) to /tmp/audit-entries.txt
 
+**Solution**
+
+### Step 1: Create the Audit Policy Directory and Policy File
+
+*Create the directory /etc/kubernetes/audit/ and write the policy manifest to /etc/kubernetes/audit/audit-policy.yaml:*
+
+```
+sudo mkdir -p /etc/kubernetes/audit /var/log/kubernetes/audit
+
+cat <<EOF | sudo tee /etc/kubernetes/audit/audit-policy.yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  # 1. Do NOT log get/list/watch on ConfigMaps
+  - level: None
+    resources:
+      - group: ""
+        resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+
+  # 2. Log all Secret access at RequestResponse level
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["secrets"]
+
+  # 3. Log Pod create/delete at Request level
+  - level: Request
+    resources:
+      - group: ""
+        resources: ["pods"]
+    verbs: ["create", "delete"]
+
+  # 4. Log everything else at Metadata level
+  - level: Metadata
+EOF
+```
+
+### Step 2: Update the kube-apiserver Static Pod Manifest
+
+*To allow the static API server pod to read the policy file and write logs to the host, you must configure both the command flags and the host path volume mounts.*
+
+**Edit /etc/kubernetes/manifests/kube-apiserver.yaml:**
+
+```
+sudo nano /etc/kubernetes/manifests/kube-apiserver.yaml
+```
+
+**1. Add Flags Under spec.containers[0].command:**
+
+```
+- --audit-policy-file=/etc/kubernetes/audit/audit-policy.yaml
+    - --audit-log-path=/var/log/kubernetes/audit/audit.log
+    - --audit-log-maxage=7
+    - --audit-log-maxbackup=3
+    - --audit-log-maxsize=100
+```
+
+**2. Add Volume Mounts Under spec.containers[0].volumeMounts:**
+
+```
+- mountPath: /etc/kubernetes/audit
+      name: audit-policy
+      readOnly: true
+    - mountPath: /var/log/kubernetes/audit
+      name: audit-logs
+      readOnly: false
+```
+
+**3. Add Volumes Under spec.volumes:**
+
+```
+- name: audit-policy
+    hostPath:
+      path: /etc/kubernetes/audit
+      type: DirectoryOrCreate
+  - name: audit-logs
+    hostPath:
+      path: /var/log/kubernetes/audit
+      type: DirectoryOrCreate
+```
+
+### Step 3: Wait for API Server Restart & Verify Audit Log Generation
+
+*Save the manifest and wait ~30-60 seconds for kubelet to restart the API server pod. Verify it comes back healthy:*
+
+```
+kubectl get pods -n kube-system -l component=kube-apiserver
+```
+
+### Step 4: Create a Secret and Verify Log Entries
+
+*Trigger secret events and write 3 matching audit entries to /tmp/audit-entries.txt:*
+
+```
+# 1. Create a test secret
+kubectl create secret generic audit-test-secret --from-literal=key=value -n default
+
+# 2. Read the secret
+kubectl get secret audit-test-secret -n default -o yaml
+
+# 3. Extract 3 formatted audit log entries to /tmp/audit-entries.txt
+sudo grep "audit-test-secret" /var/log/kubernetes/audit/audit.log | head -n 3 | sudo tee /tmp/audit-entries.txt
+```
+
+### Step 5: Validate Log File Output
+
+*Display the contents of /tmp/audit-entries.txt:*
+
+```
+cat /tmp/audit-entries.txt
+```
 *************************************************************************************************************************************************************
 
 ## Task 12 — Supply Chain: Image Verification (6%)
