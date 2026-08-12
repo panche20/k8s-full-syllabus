@@ -1827,6 +1827,168 @@ cat /tmp/audit-entries.txt
 - Create a Kyverno or Gatekeeper policy that would enforce image signature verification for namespace cks-12
 - Write the policy YAML to /tmp/image-signing-policy.yaml
 
+**Solution:**
+
+**1. The 'Why' (The Problem)**
+
+Container image tags are mutable pointers, not content identifiers. nginx:1.25 today and nginx:1.25 tomorrow can point to two completely different sets of bytes — because someone pushed over the tag, because the registry was compromised, or because a malicious actor with push access swapped it. Your cluster has zero built-in way to know "is this the exact image my CI pipeline built and scanned, or something else wearing its name?"
+
+This is precisely the SolarWinds/codecov-style attack class: compromise something upstream of the deployment (build system, registry, or the tag itself) and every consumer trusts the result blindly. Kubernetes' imagePullPolicy and RBAC control who can deploy, but say nothing about whether the artifact is what it claims to be. Vulnerability scanning (Trivy/Grype) tells you if an image is safe, but not if it's authentic — a scanner will happily give a clean bill of health to a perfectly-crafted malicious image that was never scanned by your pipeline at all.
+
+Signing closes that gap: it binds a cryptographic identity to a specific image digest, and lets the cluster refuse to admit anything that isn't provably vouched for by a trusted key.
+
+**2. Deep-Dive Mechanics**
+
+Key generation: cosign generate-key-pair creates an ECDSA P-256 keypair. The private key (cosign.key) is stored encrypted at rest using a password-derived key (scrypt KDF), wrapped in a PEM-like envelope. The public key (cosign.pub) is plain PEM — safe to distribute to every verifier (including your Kyverno controller).
+
+Signing: cosign doesn't touch or re-tag your image. It:
+
+Resolves the image reference to its immutable sha256 digest (this is why tag-based signing is actively discouraged — see the gotcha below).
+Signs that digest with the private key, producing a signature over a small JSON payload ({"critical": {"identity": ..., "image": {"docker-manifest-digest": "sha256:..."}}}).
+Pushes the signature as a separate OCI artifact to the same repository, tagged sha256-<digest>.sig. It never mutates the original manifest, so the digest you signed never changes.
+
+**Verification:** 
+
+the verifier pulls that .sig artifact, checks the signature against the provided public key, and — critically — checks that the digest inside the signed payload matches the digest of the image you're actually about to run. This second check is what stops a "signature replay" where a valid signature for image A gets attached to malicious image B.
+
+**Admission-time enforcement (Kyverno):** 
+
+verifyImages intercepts the Pod at admission, extracts every container/initContainer image reference, resolves each to its digest, does the same registry lookup + signature check cosign does, and denies the request if verification fails. It can also mutate the Pod spec to pin the tag to the verified digest (mutateDigest: true) — closing the TOCTOU window between "verified" and "actually pulled by kubelet."
+
+**3. The Alternative Landscape**
+
+<img width="875" height="487" alt="image" src="https://github.com/user-attachments/assets/6f0898fc-0f3a-4039-85ea-2ed7cc7997af" />
+
+<img width="865" height="281" alt="image" src="https://github.com/user-attachments/assets/c6accd45-3abb-4842-9358-64e03b650976" />
+
+**Why cosign + Kyverno for this task specifically:** 
+
+Gatekeeper (raw OPA) has no native concept of image signatures at all — Rego evaluates policy against the AdmissionReview object it's handed; it can't independently go fetch a signature from a registry mid-evaluation. To do signature verification with Gatekeeper you need an external system like Ratify or Connaisseur running as a sidecar/provider that does the crypto work and hands OPA a verdict to check. Kyverno, by contrast, has verifyImages built directly into its admission controller — it does the registry round-trip itself. For a single-cluster exam task, Kyverno is strictly less moving parts, which is also the practical reason most teams reach for it first for this specific use case.
+
+**4. Interview POV & Edge Cases**
+
+**How it's asked:** 
+
+"Design a way to guarantee only CI-built images run in production" or "how would you prevent someone from deploying latest with a tampered image" — they're fishing for: digest-pinning, signing, and admission-time enforcement as three separate layers, not one.
+
+**Gotchas senior engineers get asked about:**
+
+- **Signing a tag ≠ signing an image.** If you sign nginx:1.25 and someone later pushes a new image to that tag, your signature is now attached to (and still valid for) the old digest — the new push is simply unsigned. Always reason in digests; cosign will warn you if you hand it a tag.
+- **Signature verification proves origin/integrity, not safety.** A perfectly signed image can still have a critical CVE. Signing and scanning are complementary controls, not substitutes.
+- **Key compromise = silent trust break.** There's no revocation mechanism for a bare keypair the way there is with Rekor's transparency log in keyless mode — if cosign.key leaks, every image ever signed with it is suspect and you have no way to know which signatures were "before" vs "after" compromise.
+- **The classic trap in exactly this exercise:** if you run your registry as a container on the EC2 host (localhost:5000) and then point Kyverno (running inside the cluster) at localhost:5000, it resolves to the Kyverno pod's own loopback, not your host. You must use the host's private IP (or a DNS name resolvable in-cluster).
+- **Insecure (non-TLS) registries:** cosign needs --allow-insecure-registry; Kyverno's own registry client needs the same allowance configured on its controller (not just containerd's insecure-registry config, which only affects kubelet's pulls, not Kyverno's signature lookups).
+
+**5. The 'Better Way' (Evolution)**
+
+Static keypairs are the "must learn it" baseline, but production shops — especially the fintechs on your target list (Adyen, Stripe, Revolut) where SOC2/PCI-DSS auditors want to know exactly who signed what and when — increasingly use Sigstore keyless signing: your CI job authenticates to Fulcio via OIDC (its GitHub Actions/GitLab identity is the key), gets a 10-minute ephemeral cert, signs with it, and the signature + cert + timestamp gets recorded immutably in Rekor, a public transparency log. No cosign.key to leak or rotate, and every signature is independently auditable against "which CI job, which commit, which identity" rather than "whoever had the private key." Kyverno's verifyImages supports keyless verification against a Fulcio issuer/subject pattern instead of a publicKeys block — same policy shape, stronger provenance model. That's the answer worth giving if an interviewer pushes past "how do you sign an image" into "how do you do this at scale without a key-management headache."
+
+### Practical Solution — Task 12
+
+**Step 1 — Install cosign**
+
+```
+COSIGN_VERSION=$(curl -s https://api.github.com/repos/sigstore/cosign/releases/latest | grep '"tag_name"' | cut -d '"' -f4)
+curl -LO "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+sudo install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
+cosign version
+```
+
+**Step 2 — Generate the key pair into /tmp/cosign-keys/**
+
+```
+mkdir -p /tmp/cosign-keys && cd /tmp/cosign-keys
+export COSIGN_PASSWORD='Ch0se-A-Strong-Passphrase'   # non-interactive; use your own
+cosign generate-key-pair
+ls /tmp/cosign-keys      # cosign.key (encrypted private), cosign.pub
+```
+
+**Step 3 — Stand up a local registry and push the image (needed so Kyverno can look up the signature later)**
+
+```
+docker run -d -p 5000:5000 --restart=always --name registry registry:2
+
+docker pull nginx:1.25
+docker tag nginx:1.25 localhost:5000/nginx:1.25
+docker push localhost:5000/nginx:1.25
+
+# Resolve the immutable digest — never sign the tag
+DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' localhost:5000/nginx:1.25 | cut -d'@' -f2)
+echo $DIGEST
+```
+
+**Skip-push alternative:** 
+
+if you genuinely can't run a registry, use cosign sign-blob against the digest string itself instead of an image reference — it produces a detached .sig/.cert with no registry involved. Flag this to yourself as a limitation, though: a blob signature isn't something Kyverno/Gatekeeper can look up at admission time, since they query the registry for the signature artifact. It proves you can sign/verify, but it won't wire into Step 5 below.
+
+**Step 4 — Sign the digest, then verify**
+
+```
+cosign sign --key /tmp/cosign-keys/cosign.key \
+  --allow-insecure-registry \
+  --yes \
+  localhost:5000/nginx@${DIGEST}
+
+cosign verify --key /tmp/cosign-keys/cosign.pub \
+  --allow-insecure-registry \
+  localhost:5000/nginx@${DIGEST}
+```
+
+A clean run prints the verified claims as JSON and exits 0.
+
+**Step 5 — Write the Kyverno policy**
+
+Get your EC2 host's private IP first — this is the address in-cluster pods need to use, not localhost:
+
+```
+HOST_IP=$(hostname -I | awk '{print $1}')
+```
+
+```
+cat > /tmp/image-signing-policy.yaml << EOF
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: check-image-signature
+  annotations:
+    policies.kyverno.io/title: Verify Image Signatures
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/description: >-
+      Requires all Pod images deployed into the cks-12 namespace to carry
+      a valid cosign signature from the trusted key before admission.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  failurePolicy: Fail
+  rules:
+    - name: verify-image-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - cks-12
+      verifyImages:
+        - imageReferences:
+            - "${HOST_IP}:5000/*"
+          mutateDigest: true
+          verifyDigest: true
+          required: true
+          attestors:
+            - count: 1
+              entries:
+                - keys:
+                    publicKeys: |-
+$(sed 's/^/                      /' /tmp/cosign-keys/cosign.pub)
+EOF
+```
+
+This scopes enforcement to cks-12 only, targets images pulled from your signed registry, and denies any Pod whose image lacks a valid signature from cosign.pub.
+
+If your Kyverno install talks to an insecure (HTTP) registry, add the equivalent of --allowInsecureRegistry to the admission/background controller's args (Helm value admissionController.container.extraArgs on most installs) — otherwise the controller's own registry client will refuse the lookup even though your manual cosign verify succeeded.
+
 *************************************************************************************************************************************************************
 
 ## Task 13 — Trivy Operator — Continuous Scanning (6%)
@@ -1849,6 +2011,90 @@ helm install trivy-operator aquasecurity/trivy-operator \
 # Check scan results
 kubectl get vulnerabilityreports -A
 kubectl get configauditreports -A
+```
+
+**Solution**
+
+### Step 1: Install Trivy Operator via Helm
+
+*Run the commands to add the repository, update, and install the Trivy Operator in the trivy-system namespace:*
+
+```
+# Add Trivy Operator Helm repository
+helm repo add aquasecurity https://aquasecurity.github.io/helm-charts/
+helm repo update
+
+# Install Trivy Operator
+helm install trivy-operator aquasecurity/trivy-operator \
+  --namespace trivy-system \
+  --create-namespace \
+  --set trivy.ignoreUnfixed=true
+```
+
+### Step 2: Wait for Trivy Operator to Initialize
+
+*Wait 1–2 minutes for the Trivy Operator pods to start and generate the initial Custom Resources (VulnerabilityReport / ConfigAuditReport):*
+
+```
+# Watch operator pod come up
+kubectl get pods -n trivy-system -w
+```
+
+### Step 3: Inspect Scan Results in the monitoring Namespace
+
+*Check the generated VulnerabilityReport CRDs in the monitoring namespace:*
+
+```
+# View vulnerability reports in the monitoring namespace
+kubectl get vulnerabilityreports -n monitoring
+```
+
+### Step 4: Extract Detailed Vulnerability Summaries Correctly
+
+*Run this command to inspect the severity counts for all reports in monitoring and write the summary directly:*
+
+```
+cat <<EOF > /tmp/trivy-operator-report.txt
+=== Trivy Operator Vulnerability Report (monitoring namespace) ===
+EOF
+
+kubectl get vulnerabilityreports -n monitoring -o custom-columns=\
+NAME:.metadata.name,\
+REPOSITORY:.report.artifact.repository,\
+TAG:.report.artifact.tag,\
+CRITICAL:.report.summary.criticalCount,\
+HIGH:.report.summary.highCount,\
+MEDIUM:.report.summary.mediumCount,\
+LOW:.report.summary.lowCount >> /tmp/trivy-operator-report.txt
+```
+
+### Step 5: Extract Only Workloads With CRITICAL > 0
+
+*If you specifically need to capture only the workloads containing CRITICAL vulnerabilities (where criticalCount > 0):*
+
+```
+# Clear file
+cat <<EOF > /tmp/trivy-operator-report.txt
+=== Workloads with CRITICAL Vulnerabilities (monitoring) ===
+EOF
+
+# Filter for reports with CRITICAL count > 0
+kubectl get vulnerabilityreports -n monitoring -o jsonpath='{range .items[?(@.report.summary.criticalCount > 0)]}{.metadata.name}{"\t"}CRITICAL: {.report.summary.criticalCount}{"\t"}HIGH: {.report.summary.highCount}{"\n"}{end}' >> /tmp/trivy-operator-report.txt
+
+# If no workload has critical vulnerabilities, log all report summaries
+if [ $(wc -l < /tmp/trivy-operator-report.txt) -eq 1 ]; then
+  echo "No CRITICAL vulnerabilities found in monitoring namespace." >> /tmp/trivy-operator-report.txt
+  echo -e "\n=== Full Namespace Report ===" >> /tmp/trivy-operator-report.txt
+  kubectl get vulnerabilityreports -n monitoring >> /tmp/trivy-operator-report.txt
+fi
+```
+
+### Step 6: Verify the Generated File
+
+*Check the file contents:*
+
+```
+cat /tmp/trivy-operator-report.txt
 ```
 
 *************************************************************************************************************************************************************
