@@ -2382,6 +2382,312 @@ kubectl auth can-i delete pods --as=system:serviceaccount:cks-15:dev-sa -n cks-1
 
 Write verification output to /tmp/cks15-verify.txt
 
+**Solution**
+
+### Step 1: Create Namespace
+
+```
+kubectl create namespace cks-15
+```
+
+### Step 2: Enable Pod Security Admission (PSA)
+
+```
+kubectl label namespace cks-15 \
+pod-security.kubernetes.io/enforce=restricted \
+pod-security.kubernetes.io/warn=restricted \
+--overwrite
+```
+
+Verify:
+
+```
+kubectl describe namespace cks-15
+```
+
+### Step 3: Default Deny NetworkPolicy
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: cks-15
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+EOF
+```
+
+### Step 4: ResourceQuota
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: rq
+  namespace: cks-15
+spec:
+  hard:
+    pods: "5"
+    requests.cpu: "500m"
+    requests.memory: "512Mi"
+EOF
+```
+
+### Step 5: LimitRange
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: limits
+  namespace: cks-15
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: "200m"
+      memory: "128Mi"
+EOF
+```
+
+### Step 6: RBAC
+
+**Create the Role**
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ns-developer
+  namespace: cks-15
+rules:
+- apiGroups: [""]
+  resources:
+  - pods
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+
+- apiGroups: ["apps"]
+  resources:
+  - deployments
+  verbs:
+  - get
+  - list
+  - watch
+EOF
+```
+
+**Create ServiceAccount**
+
+```
+kubectl create serviceaccount dev-sa -n cks-15
+```
+
+**Bind Role**
+
+```
+kubectl create rolebinding dev-binding \
+--role=ns-developer \
+--serviceaccount=cks-15:dev-sa \
+-n cks-15
+```
+
+### Step 7: Allow Port 80 NetworkPolicy
+
+*Because the namespace has a default-deny policy, the workload needs an allow policy.*
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-http
+  namespace: cks-15
+spec:
+  podSelector:
+    matchLabels:
+      app: secure-workload
+
+  policyTypes:
+  - Ingress
+
+  ingress:
+  - ports:
+    - protocol: TCP
+      port: 80
+EOF
+```
+
+### Step 8: Deploy Hardened Pod
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-workload
+  namespace: cks-15
+  labels:
+    app: secure-workload
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    seccompProfile:
+      type: RuntimeDefault
+
+  containers:
+  - name: nginx
+    image: nginxinc/nginx-unprivileged:stable-alpine
+
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+        - ALL
+
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "64Mi"
+      limits:
+        cpu: "200m"
+        memory: "128Mi"
+
+    volumeMounts:
+    - name: tmp
+      mountPath: /tmp
+
+    - name: cache
+      mountPath: /var/cache/nginx
+
+    - name: run
+      mountPath: /var/run
+
+  volumes:
+  - name: tmp
+    emptyDir: {}
+
+  - name: cache
+    emptyDir: {}
+
+  - name: run
+    emptyDir: {}
+EOF
+```
+
+### Step 9: Verify
+
+```
+kubectl get pods -n cks-15
+```
+
+### Step 10: Verify Everything
+
+```
+{
+echo "===== Namespace ====="
+kubectl get ns cks-15 --show-labels
+
+echo
+echo "===== PSA ====="
+kubectl get psa -n cks-15 2>/dev/null || \
+kubectl describe ns cks-15 | grep pod-security
+
+echo
+echo "===== Network Policies ====="
+kubectl get networkpolicy -n cks-15
+
+echo
+echo "===== ResourceQuota ====="
+kubectl get resourcequota -n cks-15
+
+echo
+echo "===== LimitRange ====="
+kubectl get limitrange -n cks-15
+
+echo
+echo "===== Roles ====="
+kubectl get role -n cks-15
+
+echo
+echo "===== RoleBindings ====="
+kubectl get rolebinding -n cks-15
+
+echo
+echo "===== Pods ====="
+kubectl get pods -n cks-15
+
+echo
+echo "===== RBAC Tests ====="
+kubectl auth can-i list pods \
+--as=system:serviceaccount:cks-15:dev-sa \
+-n cks-15
+
+kubectl auth can-i delete pods \
+--as=system:serviceaccount:cks-15:dev-sa \
+-n cks-15
+
+} > /tmp/cks15-verify.txt
+```
+
+**Verify File**
+
+```
+cat /tmp/cks15-verify.txt
+```
+
+**Expected Results**
+
+```
+NetworkPolicies
+---------------
+default-deny
+allow-http
+
+ResourceQuota
+-------------
+pods: 5
+requests.cpu: 500m
+requests.memory: 512Mi
+
+LimitRange
+----------
+default cpu: 200m
+default memory: 128Mi
+
+Role
+----
+ns-developer
+
+RoleBinding
+-----------
+dev-binding
+
+Pod
+---
+secure-workload Running
+
+RBAC
+----
+list pods   -> yes
+delete pods -> no
+```
+
+****************************************************************************************************************************************
+
 <img width="906" height="586" alt="image" src="https://github.com/user-attachments/assets/bc4ff900-4f63-4d2a-8bff-321f53e4ebe1" />
 
 **Pass: 67%**
