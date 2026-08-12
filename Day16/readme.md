@@ -2139,6 +2139,212 @@ Your tasks — respond to the incident:
     - What you hardened
     - What you would do next (Falco rule, image scan, replace image)
 
+**Solution**
+
+### Step 1: Create the namespace and compromised Pod
+
+```
+kubectl create namespace cks-14
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: compromised-app
+  namespace: cks-14
+  labels:
+    app: compromised
+spec:
+  containers:
+  - name: app
+    image: nginx:1.25
+EOF
+```
+
+```
+kubectl get pods -n cks-14
+```
+
+### Step 2: Isolate the Pod
+
+*Create a deny-all NetworkPolicy.*
+
+```
+cat <<EOF > deny-all.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: isolate-compromised
+  namespace: cks-14
+spec:
+  podSelector:
+    matchLabels:
+      app: compromised
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress: []
+  egress: []
+EOF
+```
+
+**Apply it.**
+
+```
+kubectl apply -f deny-all.yaml
+
+Verify:
+
+kubectl get networkpolicy -n cks-14
+```
+
+### Step 3: Investigate the Pod
+
+Since nginx:1.25 has no diagnostic utilities, launch a debug container.
+
+```
+kubectl debug \
+  -it compromised-app \
+  -n cks-14 \
+  --image=nicolaka/netshoot \
+  --target=app
+```
+
+You should now see a shell prompt similar to:
+
+```
+root@compromised-app:/#
+
+Run:
+ps aux
+ss -tulpn
+netstat -tulpn
+ip addr
+ip route
+```
+
+### Step 4: Save Investigation
+
+Still inside the debug container:
+
+```
+{
+echo "===== Running Processes ====="
+ps aux
+
+echo
+echo "===== Network Connections ====="
+ss -tulpn
+
+} > /tmp/investigation.txt
+```
+
+**Display it.**
+
+```
+cat /tmp/investigation.txt
+
+# If you want the file on the node:
+
+exit
+kubectl cp \
+cks-14/compromised-app:/tmp/investigation.txt \
+/tmp/investigation.txt
+```
+
+### Step 5: Harden the Workload
+
+The running object is a Pod. Pods are immutable for these security settings. Therefore create a Deployment manifest.
+
+```
+cat <<EOF >/tmp/hardened-compromised.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: compromised-app
+  namespace: cks-14
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: compromised
+  template:
+    metadata:
+      labels:
+        app: compromised
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+EOF
+```
+
+Verify:
+
+```
+cat /tmp/hardened-compromised.yaml
+
+If required:
+
+kubectl delete pod compromised-app -n cks-14
+kubectl apply -f /tmp/hardened-compromised.yaml
+```
+
+### Step 6: Incident Summary
+
+```
+cat <<EOF >/tmp/incident-summary.txt
+Incident Response Summary
+
+Observed
+--------
+Investigated the running container using an ephemeral debug container.
+Reviewed running processes and active network connections.
+
+Isolated
+---------
+Applied a deny-all NetworkPolicy.
+Blocked all ingress traffic.
+Blocked all egress traffic.
+
+Hardened
+--------
+Created a Deployment manifest with:
+- readOnlyRootFilesystem: true
+- allowPrivilegeEscalation: false
+- Drop ALL Linux capabilities
+
+Next Steps
+----------
+1. Deploy Falco runtime detection.
+2. Scan image using Trivy.
+3. Replace compromised image.
+4. Review Kubernetes Audit Logs.
+5. Review container logs.
+6. Rotate Secrets and credentials if compromise is confirmed.
+EOF
+```
+
+Verify:
+
+```
+cat /tmp/incident-summary.txt
+```
+
+**Final Files**
+
+```
+/tmp/investigation.txt
+/tmp/hardened-compromised.yaml
+/tmp/incident-summary.txt
+```
+
 *************************************************************************************************************************************************************
 
 ## Task 15 — CKS Synthesis: Secure a Full Namespace (7%)
