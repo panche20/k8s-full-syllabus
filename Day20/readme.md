@@ -818,16 +818,46 @@ Use Gateway API for north-south (external traffic). Keep Istio VirtualService/De
 **Exercise 1: Install Istio and observe injection**
 
 ```
-# Install Istio
+# Step 1 : Download and Extract Istio
+# Download the latest Istio release
+curl -L https://istio.io/downloadIstio | sh -
+
+# Change into the extracted Istio directory (version name will match current release)
+cd istio-*
+
+# Step 2 : Add istioctl to Your System $PATH
+# Move the istioctl binary to /usr/local/bin so it is available globally across all terminal sessions:
+
+# Move binary to system PATH
+sudo cp bin/istioctl /usr/local/bin/
+
+# Verify istioctl is accessible
+istioctl version --remote=false
+
+# Step 3: Install Istio on Your Kubernetes Cluster
+# Now that istioctl is available, run your installation command to deploy the demo profile:
+
 istioctl install --set profile=demo -y
 
-# Verify control plane
-kubectl get pods -n istio-system
-# istiod-xxx          Running
-# istio-ingressgateway Running
-# istio-egressgateway  Running
+# What the demo profile installs:
+# istiod: The core control plane (Pilot/Galley/Citadel).
+# istio-ingressgateway: Ingress controller for external traffic.
+# istio-egressgateway: Egress controller for outbound traffic.
 
-# Enable injection
+# Step 4: Verify the Installation
+# Check that all Istio control plane pods are running in the istio-system namespace:
+
+kubectl get pods -n istio-system
+
+# Expected Output:
+NAME                                   READY   STATUS    RESTARTS   AGE
+istiod-7d32e92c18-x9k2p               1/1     Running   0          45s
+istio-ingressgateway-58273df82-12abc   1/1     Running   0          45s
+istio-egressgateway-69d10e82f-xyz90    1/1     Running   0          45s
+
+# Step 5: Enable Sidecar Auto-Injection (Optional)
+# To enable automatic Envoy sidecar proxy injection for workloads in any given namespace (e.g., default or cks-16), add the istio-injection=enabled label:
+
 kubectl label namespace default istio-injection=enabled
 
 # Deploy test app — observe sidecar injection
