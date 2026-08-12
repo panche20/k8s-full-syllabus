@@ -770,8 +770,8 @@ spec:
 EOF
 
 # Use it
-kubectl get urlshorteners
-kubectl explain urlshortener.spec
+kubectl get customresourcedefinition | grep url
+kubectl explain urlshorteners.apps.example.com
 
 cat <<EOF | kubectl apply -f -
 apiVersion: apps.example.com/v1
