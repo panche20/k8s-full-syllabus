@@ -1025,8 +1025,14 @@ EOF
 
 # Prove mutation works
 kubectl create deployment auto-label --image=nginx:1.25 \
-  --dry-run=server -o yaml | grep managed-by
-# managed-by: platform  ← injected by Kyverno
+  --dry-run=client -o yaml \
+  | kubectl label -f - --local team=platform -o yaml \
+  | kubectl apply -f - --dry-run=server -o yaml | grep -E "managed-by|team"
+
+# Expected Output:
+{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{},"creationTimestamp":null,"labels":{"app":"auto-label","team":"platform"},"name":"auto-label","namespace":"default"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"auto-label"}},"strategy":{},"template":{"metadata":{"creationTimestamp":null,"labels":{"app":"auto-label"}},"spec":{"containers":[{"image":"nginx:1.25","name":"nginx","resources":{}}]}}},"status":{}}
+    managed-by: platform
+    team: platform
 ```
 
 **Exercise 3: Namespace-as-a-Service simulation**
