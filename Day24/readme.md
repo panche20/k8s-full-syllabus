@@ -1092,7 +1092,7 @@ kubectl wait --for=condition=ready \
 
 # Test the simulated LLM
 kubectl run test-llm --image=curlimages/curl:latest \
-  --rm -it --restart=Never \
+  --rm -i --restart=Never -q \
   -- curl -s -X POST \
      http://llm-simulator.ml-serving.svc/v1/chat/completions \
      -H "Content-Type: application/json" \
@@ -1102,6 +1102,29 @@ kubectl run test-llm --image=curlimages/curl:latest \
          {"role": "user", "content": "What is Kubernetes?"}
        ]
      }' | python3 -m json.tool
+
+# Expected Output:
+
+{
+    "id": "sim-1786625089",
+    "object": "chat.completion",
+    "model": "llama-2-7b-chat-sim",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "[llama-2-7b-chat-sim] Responding to: 'What is Kubernetes?...' (simulated inference)"
+            },
+            "finish_reason": "stop"
+        }
+    ],
+    "usage": {
+        "prompt_tokens": 3,
+        "completion_tokens": 8,
+        "total_tokens": 11
+    }
+}
 ```
 
 **Exercise 3: Load test the LLM endpoint**
