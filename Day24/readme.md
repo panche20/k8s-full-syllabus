@@ -1252,6 +1252,9 @@ kubectl get hpa -n ml-serving
 **Exercise 4: Pipeline observability**
 
 ```
+# Create Namespace
+kubectl create ns monitoring
+
 # Create a Prometheus metrics simulation for the LLM
 cat <<'EOF' | kubectl apply -f -
 apiVersion: v1
@@ -1276,9 +1279,8 @@ EOF
 
 # Add metrics endpoint to LLM simulator
 kubectl exec -n ml-serving \
-  $(kubectl get pod -n ml-serving -l app=llm-simulator \
-    -o jsonpath='{.items[0].metadata.name}') \
-  -- curl -s http://localhost:8000/v1/models | jq .
+  $(kubectl get pod -n ml-serving -l app=llm-simulator -o jsonpath='{.items[0].metadata.name}') \
+  -- python3 -c 'import urllib.request; print(urllib.request.urlopen("http://localhost:8000/v1/models").read().decode())' | jq .
 ```
 
 ## 🎯 Part 11: Interview Questions — Day 27
