@@ -878,8 +878,8 @@ EOF
 # In production: use cert-manager to get TLS automatically
 
 # Test your webhook logic locally
-pip install flask
-python webhook.py &
+sudo apt install python3-pip
+python3 webhook.py &
 
 # Simulate a mutate request
 curl -s -X POST http://localhost:8080/mutate \
