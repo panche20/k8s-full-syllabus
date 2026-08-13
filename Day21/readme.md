@@ -956,7 +956,13 @@ curl -s -X POST http://localhost:8080/validate \
 **Exercise 2: Kyverno policy enforcement**
 
 ```
-# Install Kyverno
+# Add the official Kyverno Helm repository
+helm repo add kyverno https://kyverno.github.io/kyverno/
+
+# Update your local Helm chart repository cache
+helm repo update
+
+# Install Kyverno into the kyverno namespace
 helm install kyverno kyverno/kyverno \
   --namespace kyverno \
   --create-namespace
@@ -1123,25 +1129,4 @@ Multiple layers: label everything with team, environment, cost-center via a Muta
 **Q6: What is the Kubernetes garbage collector and how does owner references work?**
 
 Every K8s object can have ownerReferences — a list of objects that own it. When an owner is deleted, the garbage collector automatically deletes all objects that reference it. Cascading delete modes: Foreground (owner stays until all dependents are deleted — you can watch the cleanup), Background (owner deleted immediately, dependents deleted asynchronously — default), Orphan (dependents are not deleted, ownerReferences cleared). Controllers use controllerutil.SetControllerReference() to set ownership. Example: Deployment → owns ReplicaSet → owns Pods. Delete Deployment with default (Background): ReplicaSet and Pods are deleted asynchronously. This is why deleting a Deployment removes all its pods — owner references, not label selectors.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
