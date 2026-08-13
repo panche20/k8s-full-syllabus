@@ -1174,10 +1174,79 @@ spec:
 EOF
 
 # Watch the load test results
-kubectl logs -f -l job-name=llm-load-test -n ml-serving
+kubectl logs -f -l job-name=llm-load-test -n ml-serving --max-log-requests=20
+
+#Tail Logs Without Following (-f)
+kubectl logs -l job-name=llm-load-test -n ml-serving --tail=-1
+
+# Step 1: Create the HPA for llm-simulator
+cat <<EOF | kubectl apply -f -
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: llm-simulator-hpa
+  namespace: ml-serving
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: llm-simulator
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+EOF
+
+# Step 2: Verify the HPA
+kubectl get hpa -n ml-serving
+
+# Step 3: Trigger Scaling with Load Test
+# 1. Start continuous watch on HPA and Deployment replicas
+kubectl get hpa,deployment -n ml-serving -w &
+
+# 2. Re-trigger the load test job
+kubectl delete job llm-load-test -n ml-serving --ignore-not-found
+kubectl apply -f - <<'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llm-load-test
+  namespace: ml-serving
+spec:
+  parallelism: 10
+  completions: 50
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: load-tester
+        image: python:3.11-slim
+        command:
+        - python
+        - -c
+        - |
+          import urllib.request, json, time
+          url = "http://llm-simulator.ml-serving.svc/v1/chat/completions"
+          payload = json.dumps({
+              "model": "llama-2-7b-chat-sim",
+              "messages": [{"role": "user", "content": "Stress test request"}],
+              "max_tokens": 50
+          }).encode()
+          req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+          with urllib.request.urlopen(req) as resp:
+              print("Response status:", resp.status)
+        resources:
+          requests: {cpu: "50m", memory: "64Mi"}
+EOF
 
 # Check HPA kicks in (if configured)
 kubectl get hpa -n ml-serving
+
 ```
 
 **Exercise 4: Pipeline observability**
