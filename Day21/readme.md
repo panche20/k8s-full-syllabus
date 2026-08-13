@@ -859,29 +859,46 @@ def validate():
             errors.append(f"container '{c['name']}' uses :latest or untagged image")
     
     if errors:
-        return jsonify({"apiVersion":"admission.k8s.io/v1","kind":"AdmissionReview",
-            "response":{"uid":uid,"allowed":False,
-                "status":{"code":403,"message":" | ".join(errors)}}})
+        return jsonify({
+            "apiVersion":"admission.k8s.io/v1",
+            "kind":"AdmissionReview",
+            "response":{
+                "uid":uid,
+                "allowed":False,
+                "status":{"code":403,"message":" | ".join(errors)}
+            }
+        })
     
-    return jsonify({"apiVersion":"admission.k8s.io/v1","kind":"AdmissionReview",
-        "response":{"uid":uid,"allowed":True}})
+    return jsonify({
+        "apiVersion":"admission.k8s.io/v1",
+        "kind":"AdmissionReview",
+        "response":{"uid":uid,"allowed":True}
+    })
 
 @app.route('/healthz')
 def health():
     return 'ok'
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)  # HTTP for testing only
+    app.run(host='0.0.0.0', port=8080)
 EOF
 
 # For local testing — use a NodePort service + socat to avoid TLS complexity
 # In production: use cert-manager to get TLS automatically
 
 # Test your webhook logic locally
-sudo apt install python3-pip
+# Install pip and required Python packages
+sudo apt update && sudo apt install -y python3-pip python3-flask
+pip3 install flask jsonpatch --break-system-packages 2>/dev/null || pip3 install flask jsonpatch
+
+# Start the Webhook Server in the Background
 python3 webhook.py &
 
-# Simulate a mutate request
+# Confirm the process is running on port 8080:
+curl http://localhost:8080/healthz
+
+# Test Mutate and Validate Endpoints
+# Test /mutate (Injects managed-by: platform label):
 curl -s -X POST http://localhost:8080/mutate \
   -H "Content-Type: application/json" \
   -d '{
@@ -894,7 +911,20 @@ curl -s -X POST http://localhost:8080/mutate \
     }
   }' | jq .
 
-# Simulate a validate request with :latest
+# Expected Output:
+127.0.0.1 - - [13/Aug/2026 05:58:08] "POST /mutate HTTP/1.1" 200 -
+{
+  "apiVersion": "admission.k8s.io/v1",
+  "kind": "AdmissionReview",
+  "response": {
+    "allowed": true,
+    "patch": "W3sib3AiOiAiYWRkIiwgInBhdGgiOiAiL21ldGFkYXRhL2xhYmVscyIsICJ2YWx1ZSI6IHt9fSwgeyJvcCI6ICJhZGQiLCAicGF0aCI6ICIvbWV0YWRhdGEvbGFiZWxzL21hbmFnZWQtYnkiLCAidmFsdWUiOiAicGxhdGZvcm0ifV0=",
+    "patchType": "JSONPatch",
+    "uid": "test-123"
+  }
+}
+
+# Test /validate (Blocks :latest tag):
 curl -s -X POST http://localhost:8080/validate \
   -H "Content-Type: application/json" \
   -d '{
@@ -906,7 +936,21 @@ curl -s -X POST http://localhost:8080/validate \
       }
     }
   }' | jq .
-# allowed: false, message: container 'app' uses :latest
+
+# Expected Validation Response:
+127.0.0.1 - - [13/Aug/2026 05:58:24] "POST /validate HTTP/1.1" 200 -
+{
+  "apiVersion": "admission.k8s.io/v1",
+  "kind": "AdmissionReview",
+  "response": {
+    "allowed": false,
+    "status": {
+      "code": 403,
+      "message": "container 'app' uses :latest or untagged image"
+    },
+    "uid": "test-456"
+  }
+}
 ```
 
 **Exercise 2: Kyverno policy enforcement**
