@@ -838,7 +838,7 @@ kubectl delete pod fake-gpu-pod --force 2>/dev/null
 
 ```
 # Simulate a training job with data preparation
-cat <<EOF | kubectl apply -f -
+cat <<'EOF' | kubectl apply -f -
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -871,48 +871,30 @@ spec:
       - name: trainer
         image: python:3.11-slim
         command:
-        - python
+        - python3
         - -c
         - |
-          import time, os, random
-          print("Starting training...")
-          data_files = os.listdir('/data/train')
-          print(f"Found {len(data_files)} data files")
-          for epoch in range(5):
-            loss = 1.0 / (epoch + 1) + random.uniform(0, 0.1)
-            acc = 1 - loss + random.uniform(0, 0.05)
-            print(f"Epoch {epoch+1}/5 - loss: {loss:.4f} - accuracy: {acc:.4f}")
-            time.sleep(2)
-          print("Training complete! Saving model...")
-          with open('/models/model.txt', 'w') as f:
-            f.write('trained_model_v1')
-          print(f"Model saved: {os.listdir('/models')}")
+          import time, os
+          print("Loading training data from /data/train...")
+          if os.path.exists("/data/train/data.csv"):
+              with open("/data/train/data.csv") as f:
+                  print("Data content:\n" + f.read())
+          else:
+              print("No training data found!")
+          print("Training completed successfully.")
         resources:
-          requests: {cpu: "500m", memory: "256Mi"}
-          limits: {cpu: "1", memory: "512Mi"}
+          requests:
+            cpu: "50m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "64Mi"
         volumeMounts:
         - name: training-data
           mountPath: /data
-        - name: model-output
-          mountPath: /models
-
-      - name: metrics-sidecar
-        image: busybox
-        command:
-        - sh
-        - -c
-        - |
-          while true; do
-            echo "$(date): trainer running, memory=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo 'N/A')"
-            sleep 5
-          done
-        resources:
-          requests: {cpu: "50m", memory: "32Mi"}
 
       volumes:
       - name: training-data
-        emptyDir: {}
-      - name: model-output
         emptyDir: {}
 EOF
 
@@ -1036,15 +1018,4 @@ Modern servers have multiple NUMA nodes — each has local CPUs and local memory
 **Q6: How would you design a multi-tenant GPU cluster for a research team with 5 projects competing for 20 GPUs?**
 
 Namespace per project with ResourceQuota limiting nvidia.com/gpu — prevents any one project from monopolizing all 20. PriorityClass hierarchy: interactive (Jupyter notebooks) > batch-high (deadline jobs) > batch-low (hyperparameter sweeps). KEDA to scale inference services to zero when idle — frees GPUs for training. Fair queuing via Volcano's queue system — each project gets a guaranteed quota and can burst into shared capacity when others are idle. GPU time-slicing on 2-4 GPUs dedicated to dev/interactive workloads — researchers get fast iteration without waiting for full GPUs. Prometheus + Grafana dashboard showing GPU utilization per project, idle GPU hours wasted, and queue depth per priority. Weekly GPU usage reports per namespace via cost allocation labels. Preemption: batch-low pods are evicted if batch-high needs GPUs — using PriorityClass with preemptionPolicy: PreemptLowerPriority.
-
-
-
-
-
-
-
-
-
-
-
 
