@@ -828,6 +828,860 @@ kubectl get pods -o wide -w
 kubectl describe pod high-pri-pod
 ```
 
+Watch for status.nominatedNodeName appearing on high-pri-pod, and one of the low-pri-filler pods transitioning to Terminating shortly after — that's the preemption Reserve→Bind sequence playing out in real time. kubectl describe pod high-pri-pod events should show a Preempted reference.
+
+**Fix**: nothing broken — this is the system working as designed. Clean up:
+
+```
+kubectl delete deployment low-pri-filler
+kubectl delete pod high-pri-pod
+kubectl delete priorityclass low-priority high-priority
+```
+
+**Debrief**: This is the lab most people never run in practice, and it's exactly the one interviewers probe on. Note the eviction was graceful — the victim got its full terminationGracePeriodSeconds, it wasn't SIGKILLed instantly. If you'd sized high-pri-pod's request so that evicting one filler still wasn't enough, you'd see multiple simultaneous evictions, all nominated toward making room for the single pending pod.
+
+**Lab 5 — NoExecute Taint Evicts Running Pods**
+
+**Break**
+
+```
+kubectl run noexec-victim --image=nginx --restart=Never
+kubectl get pod noexec-victim -o wide   # note the node it landed on
+kubectl taint nodes <that-node> experiment=true:NoExecute
+```
+
+**Predict**: Contrast with Module 1 Lab 2 (NoSchedule) — will this existing, already-running pod be affected at all?
+
+**Diagnose**
+
+```
+kubectl get pod noexec-victim -w
+```
+
+Unlike NoSchedule (which only blocks new placements), NoExecute actively evicts pods already running on the node that lack a matching toleration — you should see it move to Terminating almost immediately.
+
+**Fix / extended test** — add a toleration with a grace period and see the delayed version:
+
+```
+kubectl taint nodes <that-node> experiment-
+kubectl run noexec-victim2 --image=nginx --restart=Never \
+  --overrides='{"spec":{"tolerations":[{"key":"experiment","operator":"Equal","value":"true","effect":"NoExecute","tolerationSeconds":30}]}}'
+kubectl taint nodes <that-node> experiment=true:NoExecute
+kubectl get pod noexec-victim2 -w
+```
+
+This one survives ~30 seconds before eviction — tolerationSeconds buys time, it doesn't grant permanence.
+
+**Debrief**: This is the taint-effect distinction interviewers specifically check: NoSchedule = gatekeeper for new arrivals only; PreferNoSchedule = soft scoring hint; NoExecute = active eviction of anyone not tolerating it, with tolerationSeconds as the only lever controlling how long they're allowed to stay. This is also the exact mechanism behind node.kubernetes.io/not-ready:NoExecute and node.kubernetes.io/unreachable:NoExecute — the automatic taints Kubernetes applies when a node fails health checks, which is why pods eventually get rescheduled off a dead node without you doing anything manually.
+
+**Lab 6 — Static Pods Bypass the Scheduler Entirely**
+
+This is exploration, not a break/fix — and it connects directly to the static-pod-corruption chaos lab you've already run.
+
+```
+# on the control-plane node
+sudo ls /etc/kubernetes/manifests/
+cat /etc/kubernetes/manifests/kube-apiserver.yaml | grep -A2 "^spec:"
+
+# back on your normal kubectl context
+kubectl get pods -n kube-system -o wide | grep kube-apiserver
+kubectl get pod -n kube-system kube-apiserver-<control-plane-node-name> -o yaml | grep -A3 "ownerReferences"
+```
+
+**Predict**: What happens if you kubectl delete this pod?
+
+```
+kubectl delete pod -n kube-system kube-apiserver-<control-plane-node-name>
+kubectl get pods -n kube-system -o wide | grep kube-apiserver -w
+```
+
+It comes right back — usually within seconds, often before you even finish reading the output.
+
+**Debrief**: ownerReferences on a static pod's mirror object points to Node, not a ReplicaSet or DaemonSet — there's no controller reconciling it via the API server at all. Kubelet watches /etc/kubernetes/manifests directly and recreates from disk the instant it notices the container gone; kubectl delete only removes the mirror object in etcd, which kubelet immediately re-creates once it reconciles. This is exactly why FailedScheduling is structurally impossible for a static pod — it never enters the scheduling queue, nodeName is fixed at manifest-authoring time, and it can't be preempted, cordoned away from, or affected by taints the normal way. If you ever need to actually change one, you edit the YAML file on disk, not kubectl edit.
+
+**Module 4 — Networking & DNS Failures (CNI / kube-proxy / CoreDNS)**
+
+This is usually the module where the "I understand K8s but can't read errors" gap is widest — because unlike a Pod's describe output, network failures often produce no Kubernetes-level error at all. The Service looks fine, the pod looks fine, and the connection just hangs. This module is about knowing which of three completely separate systems (CNI, kube-proxy, CoreDNS) to interrogate when that happens.
+
+**The 'Why' (The Problem)**
+
+Docker's default networking was single-host: containers on one machine could talk via a local bridge, but nothing routed cleanly across hosts, and port-mapping/linking was manual, brittle NAT juggling. Kubernetes needed three things Docker never solved: (1) every pod gets a real, routable IP, reachable from any other pod on any node, with no NAT between pods (the "flat network" model); (2) a stable virtual address for a constantly-churning set of pod replicas, so clients never hardcode a pod IP that might not exist five minutes from now; (3) name-based discovery, so "talk to the payments service" doesn't require knowing an IP at all. CNI solves (1), Services + kube-proxy solve (2), CoreDNS solves (3) — and critically, they are three independent systems that can each fail without touching the other two, which is exactly why "the network is broken" is close to a useless problem statement until you've isolated which of the three it actually is.
+
+**Deep-Dive Mechanics**
+
+**Layer 1 — CNI: how a pod gets an IP and a route.** When kubelet calls RunPodSandbox (Module 2), after the pause container's network namespace is created, kubelet invokes the CNI plugin binary with that namespace path. The plugin: allocates an IP from the node's podCIDR block via its IPAM component, creates a veth pair (one end stays in the pod's netns as eth0, the other end is plumbed into the host root namespace), and wires up routing so traffic can reach other nodes' pod CIDRs. How it reaches other nodes splits CNI plugins into two families:
+
+- Overlay (e.g., Flannel's VXLAN backend): pod-to-pod traffic across nodes gets encapsulated inside a UDP packet (VXLAN, typically UDP/8472) between the nodes' real IPs, then decapsulated on arrival. Simple, works over any underlying network, but adds encapsulation overhead and hides the real pod IP from anything sniffing the physical link.
+- Native routing (e.g., Calico in BGP mode): each node advertises its pod CIDR block as a real route via BGP peering with other nodes; packets travel as plain routed IP traffic, no encapsulation. Faster, but depends on the underlying network actually permitting that traffic (a cloud VPC's security groups need to allow it).
+
+**Layer 2 — kube-proxy:** how a Service ClusterIP resolves to a real pod. A ClusterIP is not bound to any interface anywhere — you cannot ping it, ARP for it, or find it with ip addr. It's purely a rule target. kube-proxy watches Service and EndpointSlice objects via the API server and programs the actual traffic redirection, in one of two dataplanes:
+
+- iptables mode (older default): a chain of NAT rules — KUBE-SERVICES matches the ClusterIP:port, jumps to a per-Service chain KUBE-SVC-<hash>, which does probabilistic selection among KUBE-SEP-<hash> chains (one per endpoint) using --probability, each of which does the actual DNAT to a real pod IP:port. This is a linear rule scan — at cluster scale (thousands of Services) this becomes measurably slow.
+- IPVS mode: uses the kernel's IPVS load balancer instead — real load-balancing algorithms (round-robin, least-conn, etc.), O(1) lookup via hash tables regardless of Service count. Requires IPVS kernel modules loaded on the node.
+
+The critical shared behavior across both modes: DNAT decisions happen on new connections. Once a connection is established, the kernel's conntrack table remembers the flow and routes subsequent packets on that same socket directly, bypassing the iptables/IPVS decision entirely. This is the root of one of the nastiest network incidents in Kubernetes — see Lab 3.
+
+**Layer 3 — CoreDNS: how names resolve.** Every pod's /etc/resolv.conf (with default dnsPolicy: ClusterFirst) points its nameserver at the kube-dns Service's ClusterIP. CoreDNS pods (a Deployment, typically 2 replicas for HA) read a Corefile that defines the resolution logic: the kubernetes plugin watches the API server directly and answers anything under <service>.<namespace>.svc.cluster.local from live Service/EndpointSlice data (not from a database — it's always current); anything outside cluster.local gets handed to the forward plugin, which sends it to an upstream resolver (often the node's own /etc/resolv.conf, or an explicit list).
+
+The part that catches people off guard: the DNS search list. A pod's resolv.conf doesn't just list one domain — it lists a search path: <namespace>.svc.cluster.local svc.cluster.local cluster.local (plus whatever the node itself adds, e.g. ec2.internal on AWS), and options ndots:5. ndots:5 means: if the name you're looking up has fewer than 5 dots, the resolver tries every entry in the search list first, appending each suffix, before ever trying the name as-is. So looking up api.stripe.com (2 dots, external, nothing to do with the cluster) triggers up to 4 failed internal lookups (api.stripe.com.default.svc.cluster.local, api.stripe.com.svc.cluster.local, api.stripe.com.cluster.local, api.stripe.com.ec2.internal) before the 5th attempt — the bare name — finally succeeds. Every one of those is a real round trip to CoreDNS. This is silent, unlogged-by-default latency that shows up as "external API calls are randomly slow" incidents.
+
+**NetworkPolicy enforcement is not kube-proxy's job** — it's the CNI's. kube-proxy only programs Service load-balancing; it has zero concept of "allow" or "deny." NetworkPolicy objects are enforced by whatever component the CNI provides for it — Calico's Felix agent, Cilium's eBPF programs, etc. If your CNI doesn't implement NetworkPolicy support (plain Flannel, for instance), the API server will happily accept and store NetworkPolicy objects that are silently never enforced by anything. This is a genuinely dangerous gap — a team believes they've locked down traffic and haven't.
+
+**The Alternative Landscape**
+
+<img width="886" height="487" alt="image" src="https://github.com/user-attachments/assets/623663d6-aa36-400c-bf62-de9e6d5bf0c5" />
+
+Why Calico (or similar) over bare Flannel for anything production-bound: NetworkPolicy is a baseline security control at any company handling payments or PII (Adyen, Revolut are exactly this) — shipping a CNI that silently no-ops policy objects is the kind of gap that fails a compliance audit. You'd reach for Cilium specifically when you need L7-aware policy or flow-level observability without adding a service mesh sidecar tax.
+
+**Interview POV & Edge Cases**
+
+The canonical prompt: "A pod can't reach another service — walk me through it." The answer they're grading is layer isolation, in order: (1) is this DNS-specific or all connectivity? — curl the Service's ClusterIP directly to rule DNS in/out; (2) if the IP works but the name doesn't, it's CoreDNS; (3) if neither works, check kubectl get endpoints — are there even any backing pods (readiness gating, Module 1); (4) if Endpoints look right but traffic still fails, check NetworkPolicy; (5) if it's cross-node specifically (same-node works, cross-node doesn't), that's your signature for a CNI/underlay problem, not a Kubernetes-object problem at all.
+
+**Gotchas**:
+
+- You cannot ping a ClusterIP. It has no interface, no ARP entry — ping will just hang or error. Testing Service reachability requires an actual protocol client (curl, nc) on the actual port.
+- Stale conntrack entries after a pod is deleted/replaced — new connections route correctly instantly (fresh DNAT decision), but any connection that was already established before the pod died can hang or reset, because conntrack bypasses the iptables/IPVS rule chain entirely for existing flows. "It's fine on retry" is the tell.
+- Default-deny NetworkPolicy + forgotten DNS egress rule — the single most common self-inflicted total-outage. The moment you apply an egress default-deny to a namespace, DNS lookups from those pods start failing too, because port 53 to CoreDNS is egress traffic like anything else, and people only think to allow the app's actual destination port.
+- NetworkPolicies are additive, never subtractive. Multiple policies selecting the same pod are OR'd together — the union of all their allow rules — not AND'd. You cannot use a second NetworkPolicy to further restrict what a first one already allowed.
+- A hang, not an instant refusal, is diagnostic. Connection refused = something's listening on the wrong port or nothing's listening at all (fast TCP RST). A long hang followed by a timeout = something is silently dropping the packet — usually NetworkPolicy, or, on your EC2-based cluster, a Security Group.
+
+
+**The 'Better Way' (Evolution)**
+
+At scale, iptables' linear rule-chain scanning becomes a real bottleneck — thousands of Services means thousands of sequential chain jumps per packet. Cilium's eBPF dataplane replaces iptables/kube-proxy entirely with O(1) hash-based lookups in the kernel, and Hubble gives you live, per-flow L3–L7 visibility (which pod talked to which pod, on what port, allowed or denied by which policy) without deploying a packet sniffer manually — this closes exactly the blind spot that makes Layer 1/2 failures so hard to see from kubectl alone. (L7/application-layer routing failures — Ingress and Gateway API specifically — are their own dedicated module coming up as Module 8, so we'll go deep on that separately.)
+
+**Module 4 Lab Pack**
+
+<img width="918" height="468" alt="image" src="https://github.com/user-attachments/assets/d2c1a7ce-7ccb-43f4-810c-64cccf1720be" />
+
+**Lab 1 — Identify Your CNI + Baseline Connectivity**
+
+```
+bash
+kubectl get pods -n kube-system -o wide
+kubectl get daemonset -n kube-system
+```
+
+Look for calico-node, kube-flannel-ds, cilium, or weave-net — whichever DaemonSet is running your data plane. This determines exactly which port matters in Lab 6, and whether Lab 2/5 will actually enforce (Calico/Cilium — yes; plain Flannel — no, and that's itself the lesson).
+
+```
+bash
+kubectl run net-a --image=nicolaka/netshoot --restart=Never -- sleep 3600
+kubectl run net-b --image=nicolaka/netshoot --restart=Never -- sleep 3600
+kubectl get pods -o wide   # confirm they landed on DIFFERENT worker nodes
+kubectl exec net-a -- curl -sm3 -o /dev/null -w "%{http_code}\n" $(kubectl get pod net-b -o jsonpath='{.status.podIP}')
+```
+
+This is your cross-node pod-to-pod baseline — every later lab that breaks connectivity gets compared against this working case.
+
+**Lab 2 — Default-Deny NetworkPolicy Blocks DNS**
+
+**Break**
+
+```
+kubectl create ns netpol-test
+kubectl run web --image=nginx -n netpol-test --labels=app=web
+kubectl expose pod web -n netpol-test --port=80
+kubectl run client --image=nicolaka/netshoot -n netpol-test --restart=Never -- sleep 3600
+
+cat <<'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: netpol-test
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+EOF
+```
+
+**Predict**: Will client fail to resolve DNS, fail to reach web by IP, both, or neither?
+
+**Diagnose**
+
+```
+kubectl exec -n netpol-test client -- nslookup web.netpol-test.svc.cluster.local
+kubectl exec -n netpol-test client -- curl -sm3 $(kubectl get pod -n netpol-test web -o jsonpath='{.status.podIP}')
+```
+
+Both should hang and time out — an empty podSelector: {} with no egress rules blocks everything leaving the pod, including the DNS query itself.
+
+**Fix**
+
+```
+cat <<'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: netpol-test
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+EOF
+kubectl exec -n netpol-test client -- nslookup web.netpol-test.svc.cluster.local
+```
+
+(kubernetes.io/metadata.name is auto-applied to every namespace since 1.21+ — no manual labeling needed.)
+
+**Debrief**: If your CNI is plain Flannel with no policy engine, both nslookup and curl succeeded the whole time, even with the deny policy applied — confirm that with kubectl describe networkpolicy -n netpol-test (the object exists) versus the actual traffic result (unaffected). That gap is the lesson: NetworkPolicy objects existing in etcd tells you nothing about whether anything is enforcing them. If it's Calico/Cilium and it did block traffic: note that DNS died as pure collateral damage of a policy that was never really about DNS — this exact pattern is the single most common "everything is broken" ticket that turns out to be networking-team-adjacent.
+
+**Lab 3 — Stale Conntrack Entry After Pod Deletion**
+
+**Break**
+
+```
+kubectl create deployment conntrack-demo --image=nginx --replicas=1
+kubectl expose deployment conntrack-demo --port=80
+kubectl get pods -o wide -l app=conntrack-demo   # note pod name + its node
+```
+
+Open a persistent connection from a client pod (leave this running in its own terminal):
+
+```
+bash
+kubectl run conn-client --image=nicolaka/netshoot --restart=Never -- sleep 3600
+kubectl exec -it conn-client -- nc -v $(kubectl get svc conntrack-demo -o jsonpath='{.spec.clusterIP}') 80
+```
+
+This opens and holds a raw TCP connection (no HTTP request needed — the handshake alone is enough to create a conntrack entry). Leave it open.
+
+**Predict**: If you delete the backing pod right now, does this already-open connection get transparently redirected to a replacement pod, hang, or reset?
+
+**Diagnose** — in a second terminal, on the worker node hosting the pod:
+
+```
+bash
+sudo conntrack -L | grep <conntrack-demo-pod-ip>
+```
+
+You should see an ESTABLISHED entry mapping the client to that specific pod IP. Now delete the pod:
+
+```
+kubectl delete pod <conntrack-demo-pod-name>
+kubectl get endpoints conntrack-demo   # new pod IP appears within seconds
+```
+
+Check back on the nc session — depending on your CNI's cleanup speed, you'll see one of two outcomes: it hangs with no data until the conntrack entry eventually times out, or it gets an immediate reset once the veth interface is torn down. Either outcome demonstrates the same underlying fact: iptables/IPVS never re-evaluates an already-established flow — only a brand new connection gets a fresh, correct DNAT decision.
+
+**Fix / proof: open a fresh connection right now and confirm it routes correctly on the first try:**
+
+```
+kubectl exec -it conn-client -- nc -v -w2 $(kubectl get svc conntrack-demo -o jsonpath='{.spec.clusterIP}') 80
+```
+
+**Debrief**: This is the mechanism behind "the error went away when I retried" — a maddening non-error that has no Kubernetes Event, no log line, nothing in describe. It only shows up as application-level symptoms (hung requests, timeouts) during rolling deploys. The diagnostic signature: symptoms correlate with pod churn, and a brand-new connection always works fine while an old one doesn't.
+
+**Lab 4 — CoreDNS Scaled to Zero**
+
+**Break**
+
+```
+bash
+kubectl -n kube-system scale deployment coredns --replicas=0
+```
+
+**Predict**: Will pod-to-pod connectivity by IP still work? Will Services still load-balance correctly if you already know the ClusterIP?
+
+**Diagnose**
+
+```
+kubectl exec net-a -- nslookup net-b   # (from Lab 1's pods)
+kubectl exec net-a -- curl -sm3 -o /dev/null -w "%{http_code}\n" <net-b's raw pod IP>
+```
+
+DNS resolution fails/times out completely; direct-IP connectivity is entirely unaffected — proof that CNI and DNS are fully independent failure domains.
+
+**Fix**
+
+```
+kubectl -n kube-system scale deployment coredns --replicas=2
+kubectl -n kube-system get pods -l k8s-app=kube-dns -w   # wait for Running + Ready
+kubectl exec net-a -- nslookup net-b
+```
+
+**Debrief**: This is the cleanest possible demonstration that "the network is down" is too vague a symptom to act on — raw connectivity (CNI) and name resolution (CoreDNS) can fail completely independently of each other. Always test both explicitly rather than assuming one implies the other.
+
+**Lab 5 — Selective NetworkPolicy Ingress (Additive Behavior)**
+
+**Break**
+
+```
+kubectl create ns netpol-selective
+kubectl run backend --image=nginx -n netpol-selective --labels=app=backend
+kubectl expose pod backend -n netpol-selective --port=80
+kubectl run allowed-client --image=busybox -n netpol-selective --labels=role=trusted --command -- sleep 3600
+kubectl run blocked-client --image=busybox -n netpol-selective --labels=role=untrusted --command -- sleep 3600
+
+cat <<'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: only-trusted
+  namespace: netpol-selective
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: ["Ingress"]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          role: trusted
+EOF
+```
+
+**Predict**: Which client succeeds, which times out — and will the outcome differ if you add a second NetworkPolicy also selecting backend?
+
+**Diagnose**
+
+```
+kubectl exec -n netpol-selective allowed-client -- wget -qO- --timeout=3 backend
+kubectl exec -n netpol-selective blocked-client -- wget -qO- --timeout=3 backend
+```
+
+allowed-client succeeds, blocked-client hangs and times out (assuming your CNI enforces policy — see Lab 2's caveat if not).
+
+**Fix / prove additive behavior** — add a second, independent policy also allowing traffic on a different label:
+
+```
+kubectl label pod blocked-client -n netpol-selective role=untrusted tier=frontend --overwrite
+cat <<'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: also-allow-frontend
+  namespace: netpol-selective
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: ["Ingress"]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: frontend
+EOF
+kubectl exec -n netpol-selective blocked-client -- wget -qO- --timeout=3 backend
+```
+
+blocked-client now succeeds — even though only-trusted (which it still doesn't match) is still applied.
+
+**Debrief**: This is the additive-policy gotcha made concrete — a second policy never narrows what a first one allowed; it only ever widens it. If someone believes they've "further restricted" backend access by adding a second, more specific NetworkPolicy, this lab shows exactly why that belief is wrong.
+
+**Lab 6 — Security Group Blocks CNI Overlay/Peering Port (AWS-Specific)**
+
+This is the layer below Kubernetes entirely — the underlying AWS network refusing to carry CNI traffic between your EC2 instances. 
+
+**Do this carefully; only touch the specific rule you add, and remove it immediately after observing the effect.**
+
+Identify your port first, based on Lab 1's CNI discovery:
+
+- Flannel (VXLAN backend): UDP/8472
+- Calico (VXLAN mode): UDP/4789 · Calico (IPIP mode): IP protocol 4 · Calico (BGP mode): TCP/179
+- Cilium (VXLAN mode, default): UDP/8472
+
+Break — find your worker nodes' security group and add a temporary deny-equivalent by removing the relevant allow rule (or use a NACL deny if your SG doesn't isolate it cleanly):
+
+```
+aws ec2 describe-instances --filters "Name=tag:Name,Values=<your-worker-tag>" \
+  --query "Reservations[].Instances[].SecurityGroups"
+# note the SG ID, then temporarily revoke the specific CNI port between nodes
+aws ec2 revoke-security-group-ingress --group-id <sg-id> \
+  --protocol udp --port 8472 --source-group <sg-id>
+```
+
+**Predict**: Will same-node pod-to-pod traffic be affected? Cross-node?
+
+**Diagnose**
+
+```
+kubectl run same-node-test --image=nicolaka/netshoot --restart=Never --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"<same-node-as-net-a>"}}}' -- sleep 3600
+kubectl exec net-a -- curl -sm3 -o /dev/null -w "same-node: %{http_code}\n" $(kubectl get pod same-node-test -o jsonpath='{.status.podIP}')
+kubectl exec net-a -- curl -sm3 -o /dev/null -w "cross-node: %{http_code}\n" $(kubectl get pod net-b -o jsonpath='{.status.podIP}')
+```
+
+Same-node traffic (never leaves the host, no encapsulation involved) keeps working; cross-node traffic times out.
+
+**Fix**
+
+```
+aws ec2 authorize-security-group-ingress --group-id <sg-id> \
+  --protocol udp --port 8472 --source-group <sg-id>
+kubectl exec net-a -- curl -sm3 -o /dev/null -w "cross-node restored: %{http_code}\n" $(kubectl get pod net-b -o jsonpath='{.status.podIP}')
+```
+
+**Debrief**: "Same-node works, cross-node doesn't" is the diagnostic signature that the problem lives below Kubernetes entirely — in the VPC/SG/NACL layer, not in any Kubernetes object. No amount of staring at kubectl describe will surface this; nothing in the cluster's own state is wrong. This is a real, recurring incident category at any company running self-managed kubeadm on EC2 rather than EKS (where AWS manages this wiring for you) — exactly your setup.
+
+**Lab 7 — ndots:5 DNS Query Amplification**
+
+**Break**: nothing to break — this is observing default behavior.
+
+```
+kubectl exec net-a -- cat /etc/resolv.conf
+```
+
+Note the search line and options ndots:5.
+
+**Predict**: For an external name like example.com (1 dot), how many actual DNS queries do you expect one nslookup to generate?
+
+**Diagnose** — capture on the node running CoreDNS while you trigger one lookup:
+
+```
+kubectl get pods -n kube-system -o wide -l k8s-app=kube-dns   # note the node
+```
+
+*SSH to that node in one terminal:*
+
+```
+sudo tcpdump -i any -n udp port 53 -l
+```
+
+In another terminal, trigger a single external lookup:
+
+```
+kubectl exec net-a -- nslookup example.com
+```
+
+Count the distinct query packets in the tcpdump output — expect 4–5 queries (example.com.default.svc.cluster.local, .svc.cluster.local, .cluster.local, possibly a node search domain, each returning NXDOMAIN, before the final bare example.com. succeeds).
+
+**Fix / comparison** — a fully-qualified name (trailing dot) skips the search list entirely:
+
+```
+kubectl exec net-a -- nslookup example.com.
+```
+
+Watch the same tcpdump session — this time, one query only.
+
+**Debrief**: This is invisible in every dashboard that only tracks HTTP/application latency — it lives purely at the DNS layer, and by default CoreDNS doesn't even log queries (the log plugin is off by default). At real production scale, this is a genuine multiplier on CoreDNS load and a real source of intermittent external-call latency, and the fix in application code (using trailing-dot FQDNs, or reducing unnecessary search domains) is something very few engineers think to check until they've done exactly this exercise once.
+
+**Module 5 — Storage Failures (CSI Driver Internals & the Attach/Mount Lifecycle)**
+
+This module tends to surprise people because storage failures span the widest range of layers of anything so far — a stuck PVC can be a Kubernetes object problem, a cloud API permissions problem, or a raw block-device problem, and kubectl describe often shows you almost nothing useful for the middle one.
+
+**The 'Why' (The Problem)**
+
+Before CSI, volume plugins were compiled directly into Kubernetes core — kubelet and the controller-manager shipped with hardcoded, vendor-specific code for AWS EBS, GCE PD, Azure Disk, vSphere, and others baked right into the binary (the "in-tree" plugins). This meant a storage vendor couldn't fix a bug or ship a feature without getting a PR merged into upstream Kubernetes and waiting for the next full Kubernetes release — vendor velocity was hostage to the Kubernetes release cycle, and the core binary kept bloating with every new cloud's volume logic. CSI (Container Storage Interface) solved this the same way CRI solved it for runtimes (Module 2): a standard, versioned gRPC contract that lets any storage vendor ship an out-of-tree driver, deployed and upgraded independently, with zero changes to Kubernetes core. By the way — this isn't optional history: in-tree cloud volume plugins were removed from Kubernetes entirely as of 1.27+, so CSI is mandatory for cloud-backed storage on any current cluster, yours included.
+
+**Deep-Dive Mechanics**
+
+**The CSI driver is two separate deployments, not one. Every CSI driver ships as:**
+
+- Controller plugin — a Deployment (leader-elected, one active replica) that talks to the cloud API (EBS CreateVolume, AttachVolume, etc.). It doesn't need to run on every node — it just needs cloud credentials and network access to AWS's control plane.
+- Node plugin — a DaemonSet, one pod per node, that does the actual local block-device work: formatting, mounting, unmounting. It needs to run everywhere a pod might need a volume.
+
+Neither talks to the cloud API or the node directly by itself — both wrap a set of sidecar containers that translate Kubernetes-object watches into CSI gRPC calls against the vendor's driver container in the same pod: csi-provisioner (watches PVCs → CreateVolume), csi-attacher (watches VolumeAttachment objects → ControllerPublishVolume), csi-resizer (watches PVC size edits → ControllerExpandVolume), node-driver-registrar (registers the node plugin with kubelet), and a livenessprobe. This sidecar pattern is why a CSI driver pod in kubectl get pods shows 3-4 containers, not one.
+
+**The full lifecycle, in order:**
+
+```
+1. PVC created
+   → (WaitForFirstConsumer: paused here until a pod needs it — see Module 3)
+2. csi-provisioner sees PVC → calls CreateVolume RPC → AWS creates the EBS volume
+   → PV object created, bound to the PVC
+3. Pod scheduled to a node (VolumeBinding filter already confirmed AZ match)
+4. csi-attacher creates a VolumeAttachment object → calls ControllerPublishVolume
+   → AWS attaches the EBS volume to that specific EC2 instance
+5. kubelet's volume manager on the node calls:
+   a. NodeStageVolume  — format (if needed) + mount to a per-node staging path
+   b. NodePublishVolume — bind-mount from staging path into the pod's actual mount path
+6. Container starts with the volume already mounted
+```
+
+Steps 1–2 and 4 happen on the controller (control-plane-adjacent, cloud-API-facing). Step 5 happens on the node the pod landed on. That split is the single most important thing to internalize for troubleshooting — a stuck volume could be failing at a step that has nothing to do with the node your pod is on at all.
+
+**The VolumeAttachment object is the ground truth for "is this volume attached, and where."** It's easy to overlook because nothing in a normal workflow ever has you look at it directly — but it's the API-level record of the controller's attach state, and it persists independently of pod or even node lifecycle. A VolumeAttachment left behind after a node dies ungracefully is the direct cause of the most common storage incident in Kubernetes (Lab 4).
+
+**Access modes are a hard cloud-storage constraint, not a Kubernetes policy choice.** EBS is fundamentally block storage attachable to exactly one instance at a time — it can only ever support ReadWriteOnce. Scaling a Deployment to 2+ replicas that all reference the same EBS-backed PVC doesn't create 2 volumes; it creates 1 volume 2 pods are fighting to attach, and the loser gets stuck. Real ReadWriteMany requires network filesystem storage (EFS/NFS) — an entirely different CSI driver, not a config flag on the EBS one.
+
+**Reclaim policy determines what happens to the underlying cloud resource, not just the K8s object.** Delete (default for most dynamic StorageClasses): deleting the PVC triggers DeleteVolume — the actual EBS volume is destroyed, data gone. Retain: the PV object survives in a Released state, the EBS volume itself is left alone in AWS, but it's not automatically reusable — a human has to either delete it manually or clear claimRef on the PV to rebind it. This is a deliberate data-safety default for StatefulSets and databases, and it's exactly why "I deleted my StatefulSet and my PVCs are still there costing money a week later" is such a common, non-obvious surprise.
+
+**The Alternative Landscape**
+
+<img width="877" height="405" alt="image" src="https://github.com/user-attachments/assets/57d472e1-68ea-4aa5-8f49-25b3d45d2eb8" />
+
+<img width="858" height="256" alt="image" src="https://github.com/user-attachments/assets/653ee69c-18f2-4458-8f8e-64e2e529fa24" />
+
+You'd default to EBS for the overwhelming majority of stateful workloads at companies like Adyen or Revolut (single-writer databases, message queue disks) specifically because RWO is what you actually want most of the time — multi-writer access to the same block volume is rarely what a correctly-designed stateful app needs anyway. You'd reach for EFS specifically when multiple pods genuinely need concurrent write access to the same files, and Local PV specifically when you've deliberately pushed replication up to the application layer (e.g. a Kafka cluster) and want to trade node-loss durability for raw I/O speed.
+
+**Interview POV & Edge Cases**
+
+Classic prompt: "A pod is stuck in ContainerCreating because of a volume — walk me through your triage." The layered answer they want: check PVC status first (Bound vs Pending — tells you if provisioning even succeeded); if Bound, check for a VolumeAttachment object and its state; if attach looks fine, the problem is node-local — check the CSI node plugin pod's logs on that specific node, not the controller's. Weak candidates jump straight to kubectl describe pod and stop there when it just says "waiting for volume" with no further detail — that message is often the symptom, and the real error lives in a completely different pod's logs (the CSI controller), not the failing pod's own Events.
+
+**Gotchas**:
+
+- Multi-Attach error the instant someone scales an EBS-backed Deployment past 1 replica — this is an access-mode limitation, not a bug, and no amount of retrying fixes it.
+- A VolumeAttachment surviving an ungracefully terminated node (spot reclaim, hard power-off) blocks any other node from attaching that same volume — AWS still thinks it's attached to a host that no longer exists from Kubernetes' point of view. The dangerous mistake here is force-deleting the VolumeAttachment when you're not actually certain the instance is gone — if that node comes back and still has the volume attached at the OS level while another pod has also mounted it elsewhere, that's real data corruption, not just an inconvenience.
+- StatefulSet PVCs are not deleted when the StatefulSet is deleted, by default. This surprises people in both directions — unexpected lingering cost, or unexpectedly getting old data back when a StatefulSet is recreated with the same name. persistentVolumeClaimRetentionPolicy (GA in newer versions) lets you make this explicit instead of relying on the surprising default.
+- ImmediateBinding + multi-AZ workers provisions a volume before the scheduler has picked a node — if the pod later lands in a different AZ, you get a permanently stuck volume node affinity conflict (this is exactly Module 3 Lab 3's failure mode, now from the dynamic provisioning side instead of a manually-crafted PV).
+- On a self-managed kubeadm cluster (yours), there's no IRSA out of the box. EKS gives pods scoped IAM roles via an OIDC provider automatically; on kubeadm, the CSI controller pod's AWS credentials typically come from the underlying EC2 instance's instance profile role — whatever node the controller pod happens to land on needs that role attached, or every cloud API call fails with an access-denied error visible only in the CSI controller's own pod logs, never in kubectl describe pvc.
+
+**The 'Better Way' (Evolution)**
+
+**Generic ephemeral volumes** (inline in the pod spec) handle scratch-space needs without the full PVC/PV lifecycle overhead at all — useful for anything that doesn't need to survive the pod. CSI VolumeSnapshots give every CSI driver a standardized backup/restore/clone primitive instead of vendor-specific scripts. And architecturally, the biggest "better way" for a lot of workloads is sidestepping the attach/detach lifecycle's entire failure surface by going object-storage-first (S3) wherever the access pattern allows it — no VolumeAttachment, no AZ-affinity, no attach/detach controller involved at all. Worth noting operationally: fast node churn from Karpenter-style autoscaling or spot consolidation makes the stuck-VolumeAttachment failure mode more common, not less — which is exactly why proper node draining before termination matters more, not less, as clusters get more elastic.
+
+**Module 5 Lab Pack**
+
+<img width="900" height="452" alt="image" src="https://github.com/user-attachments/assets/c6b6a760-b4ea-43ee-abe4-5c19fb493ed1" />
+
+**Lab 1 — CSI Driver / IAM Permissions**
+
+**Break / discover**
+
+```
+bash
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-ebs-csi-driver
+kubectl get sc
+```
+
+If nothing shows up, install it deliberately before attaching any IAM permissions, so you hit the real gotcha:
+
+```
+bash
+helm repo add aws-ebs-csi-driver https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+helm repo update
+helm upgrade --install aws-ebs-csi-driver aws-ebs-csi-driver/aws-ebs-csi-driver -n kube-system --create-namespace
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-ebs-csi-driver
+```
+**Create a StorageClass and a PVC:**
+
+```
+cat <<'EOF' | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-sc
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+EOF
+
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-claim
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ebs-sc
+  resources:
+    requests:
+      storage: 5Gi
+EOF
+kubectl run vol-test --image=nginx --overrides='{"spec":{"containers":[{"name":"vol-test","image":"nginx","volumeMounts":[{"name":"v","mountPath":"/data"}]}],"volumes":[{"name":"v","persistentVolumeClaim":{"claimName":"test-claim"}}]}}'
+```
+
+**Predict**: Where will the real error message live — kubectl describe pvc, kubectl describe pod, or somewhere else entirely?
+
+**Diagnose**
+
+```
+bash
+kubectl get pvc test-claim   # stuck Pending
+kubectl describe pvc test-claim   # usually just "waiting for a volume to be created" — not useful
+kubectl logs -n kube-system -l app.kubernetes.io/name=aws-ebs-csi-driver -c csi-provisioner --tail=50
+```
+
+Expect an AccessDenied / UnauthorizedOperation error in the provisioner sidecar's logs — nowhere in the PVC or pod's own description.
+
+**Fix** — find and grant the instance role EBS permissions:
+
+```
+# find the role attached to whichever worker the controller pod landed on
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-ebs-csi-driver -o wide
+aws ec2 describe-instances --filters "Name=private-dns-name,Values=<that-node-name>" \
+  --query "Reservations[].Instances[].IamInstanceProfile.Arn"
+aws iam attach-role-policy --role-name <role-name> \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+kubectl get pvc test-claim -w
+```
+
+**Debrief**: This is the defining lesson of the module — the failing object (test-claim) tells you almost nothing, while the actual error sits in a sidecar container's logs on a completely different pod. This exact gap (controller-side cloud-API failure, invisible at the PVC level) is the reason experienced engineers check CSI controller logs early rather than staring at describe pvc repeatedly hoping for more detail that isn't coming.
+
+**Lab 2 — Immediate Binding + AZ Mismatch (Dynamic Provisioning)**
+
+**Break** — first check whether your two workers are actually in different AZs (this determines whether you'll see the failure at all):
+
+```
+bash
+kubectl get nodes -o custom-columns=NAME:.metadata.name,ZONE:'.metadata.labels.topology\.kubernetes\.io/zone'
+```
+
+If they're in the same AZ, skip straight to the Debrief — Immediate binding can't mismatch what only has one possible AZ, and that null result is itself worth understanding. If different AZs
+
+```
+cat <<'EOF' | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-immediate
+provisioner: ebs.csi.aws.com
+volumeBindingMode: Immediate
+EOF
+
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: immediate-claim
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ebs-immediate
+  resources:
+    requests:
+      storage: 5Gi
+EOF
+kubectl get pvc immediate-claim -w   # note which AZ it actually provisioned into
+```
+
+Now force the pod onto the other AZ's node:
+
+```
+bash
+kubectl run az-mismatch --image=nginx \
+  --overrides='{"spec":{"nodeSelector":{"topology.kubernetes.io/zone":"<the-OTHER-az>"},"containers":[{"name":"az-mismatch","image":"nginx","volumeMounts":[{"name":"v","mountPath":"/data"}]}],"volumes":[{"name":"v","persistentVolumeClaim":{"claimName":"immediate-claim"}}]}}'
+```
+
+**Predict**: Is this fixable by waiting, or is it permanent?
+
+**Diagnose**
+
+```
+bash
+kubectl describe pod az-mismatch
+```
+
+Expect volume node affinity conflict — permanent, no amount of retrying resolves it, because the physical EBS volume genuinely cannot move AZs.
+
+**Fix**
+
+```
+kubectl delete pod az-mismatch
+kubectl delete pvc immediate-claim
+# recreate the PVC using the ebs-sc StorageClass from Lab 1 (WaitForFirstConsumer) instead
+```
+
+**Debrief**: This is Module 3 Lab 3's manually-constructed scenario happening for real, with dynamic provisioning — and it's the concrete reason WaitForFirstConsumer is the correct default for almost every real StorageClass: it delays provisioning until the scheduler has already committed to a node, so the CSI driver provisions in the right AZ automatically instead of gambling on Immediate.
+
+**Lab 3 — Multi-Attach Error**
+
+**Break**
+
+```
+kubectl create deployment multiattach-demo --image=nginx --replicas=1
+kubectl set volumes deployment multiattach-demo --add --name=data --type=persistentVolumeClaim \
+  --claim-name=multiattach-pvc --claim-size=5Gi --claim-class=ebs-sc --mount-path=/data
+kubectl get pvc multiattach-pvc -w   # wait for Bound
+kubectl scale deployment multiattach-demo --replicas=2
+```
+
+**Predict**: Will the second replica go Pending (scheduler-level) or get scheduled and fail later (attach-level)?
+
+**Diagnose**
+
+```
+bash
+kubectl get pods -l app=multiattach-demo -o wide
+kubectl describe pod <second-replica-pod>
+```
+
+
+Expect the second pod to get scheduled just fine (nothing about the PVC blocks scheduling itself), then sit in ContainerCreating with an Event like Multi-Attach error for volume "..." Volume is already exclusively attached to one node and can't be attached to another.
+
+**Fix**
+
+```
+bash
+kubectl scale deployment multiattach-demo --replicas=1
+```
+
+(The real fix for genuinely needing 2+ replicas with shared storage is switching to an EFS-backed RWX StorageClass, or giving each replica its own PVC via a StatefulSet's volumeClaimTemplates if they don't actually need to share data.)
+
+**Debrief**: Note this failed at the attach step, not the schedule step — the scheduler has no concept of "this PVC is already attached elsewhere," because VolumeBinding (Module 3) only checks AZ/node-affinity compatibility, not exclusivity. Exclusivity is enforced later, by the attacher, which is exactly why this shows up as ContainerCreating + a Multi-Attach Event rather than Pending + FailedScheduling.
+
+**Lab 4 — Stuck VolumeAttachment After Node Goes Unresponsive**
+
+**Break**
+
+```
+kubectl create deployment stuck-attach-demo --image=nginx --replicas=1
+kubectl set volumes deployment stuck-attach-demo --add --name=data --type=persistentVolumeClaim \
+  --claim-name=stuck-attach-pvc --claim-size=5Gi --claim-class=ebs-sc --mount-path=/data
+kubectl get pods -l app=stuck-attach-demo -o wide   # note the node
+kubectl get volumeattachment   # find the one referencing your PVC's PV
+```
+
+Simulate an unresponsive node without actually terminating the EC2 instance (safer, fully reversible) — SSH to that worker and stop kubelet:
+
+```
+bash
+ssh -i <key>.pem ubuntu@<that-worker-ip>
+sudo systemctl stop kubelet
+```
+
+**Predict**: Once the node goes NotReady, will the Deployment's replacement pod (rescheduled to the other worker) get its volume attached cleanly?
+
+**Diagnose** — back on the master, wait for NotReady and the pod reschedule:
+
+```
+kubectl get nodes -w
+kubectl get pods -l app=stuck-attach-demo -o wide
+kubectl describe pod <new-pod-on-other-worker>
+kubectl get volumeattachment
+```
+
+Expect the new pod stuck in ContainerCreating, and the original VolumeAttachment object still present, still pointing at the down node — Kubernetes hasn't detached it because it can't confirm the old node has actually released it.
+
+**Fix** — restart kubelet on the original node rather than force-deleting anything (the safe resolution path):
+
+```
+bash
+# back on the original worker
+sudo systemctl start kubelet
+bash
+# back on master — watch the attach/detach controller clean up automatically
+kubectl get volumeattachment -w
+kubectl get pods -l app=stuck-attach-demo -o wide -w
+```
+
+**Debrief**: This is deliberately built to demonstrate the safe resolution path, not the dangerous shortcut. You'll see kubectl delete volumeattachment <name> --force mentioned in incident runbooks online — that command exists for genuine node-loss scenarios (terminated instance, confirmed gone) but it bypasses the safety check that prevents double-attachment. If the node were actually still alive and still had the volume mounted at the OS level, force-deleting the VolumeAttachment and letting another node attach the same volume is a real data-corruption path. The correct default instinct is "wait for the attach/detach controller's own timeout-based reconciliation" or "confirm the node is truly gone first" — not "force it immediately because the pod is stuck."
+
+**Lab 5 — Volume Expansion (Controller vs Node Expand)**
+
+**Break** — first confirm your StorageClass allows it:
+
+```
+bash
+kubectl get sc ebs-sc -o yaml | grep allowVolumeExpansion
+```
+
+**If missing:**
+
+```
+bash
+kubectl patch sc ebs-sc -p '{"allowVolumeExpansion": true}'
+```
+
+Now grow the PVC from Lab 1:
+
+```
+bash
+kubectl patch pvc test-claim -p '{"spec":{"resources":{"requests":{"storage":"10Gi"}}}}'
+```
+
+**Predict**: Does the filesystem inside the running pod grow immediately, or is another step required?
+
+**Diagnose**
+
+```
+bash
+kubectl get pvc test-claim -w   # watch conditions
+kubectl describe pvc test-claim   # look for Resizing / FileSystemResizePending conditions
+kubectl exec vol-test -- df -h /data
+```
+
+You'll typically see the PVC's .status.capacity update relatively fast (controller-side ControllerExpandVolume — the EBS API call), but df -h inside the pod may still show the old size briefly, flagged by a FileSystemResizePending condition until kubelet performs NodeExpandVolume on its next sync.
+
+**Fix / confirm** — if it doesn't resolve within a minute or two on its own:
+
+```
+bash
+kubectl exec vol-test -- df -h /data   # re-check after kubelet's next sync
+```
+
+**Debrief**: This two-phase behavior (ControllerExpandVolume grows the cloud volume; NodeExpandVolume grows the filesystem inside it) is exactly the controller/node split from the Deep-Dive playing out again — a resize that "worked" at the cloud level can still show the old size to the application until the node-side step catches up. Depending on your exact Kubernetes/driver version, some combinations require the pod to restart for the filesystem-level growth to apply — worth explicitly checking your version's behavior rather than assuming online expansion always works with zero disruption.
+
+**Lab 6 — StatefulSet PVC Retention + Reclaim Policy**
+
+**Break**
+
+```
+cat <<'EOF' | kubectl apply -f -
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sts-demo
+spec:
+  serviceName: sts-demo
+  replicas: 1
+  selector:
+    matchLabels: {app: sts-demo}
+  template:
+    metadata:
+      labels: {app: sts-demo}
+    spec:
+      containers:
+      - name: app
+        image: nginx
+        volumeMounts:
+        - name: data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: ebs-sc
+      resources:
+        requests:
+          storage: 2Gi
+EOF
+kubectl get pvc -l app=sts-demo
+kubectl exec sts-demo-0 -- sh -c "echo 'important data' > /data/marker.txt"
+```
+
+**Predict**: If you delete the StatefulSet right now, does its PVC get deleted too?
+
+**Diagnose / Fix cycle**
+
+```
+bash
+kubectl delete statefulset sts-demo
+kubectl get pvc -l app=sts-demo   # still there
+kubectl apply -f - <<'EOF'
+# (reapply the same StatefulSet manifest from above)
+EOF
+kubectl exec sts-demo-0 -- cat /data/marker.txt
+```
+
+The recreated pod reattaches the same PVC and your marker file is still there — StatefulSet deletion never touched the PVC.
+
+Now test reclaim policy directly:
+
+```
+kubectl get pv $(kubectl get pvc -l app=sts-demo -o jsonpath='{.items[0].spec.volumeName}') -o yaml | grep persistentVolumeReclaimPolicy
+kubectl delete statefulset sts-demo
+kubectl delete pvc -l app=sts-demo
+kubectl get pv   # check whether the PV (and underlying EBS volume) is gone or sitting in Released
+```
+
+**Debrief**: If the policy was Delete (typical default for dynamic StorageClasses), the PV and the real EBS volume are both gone now — permanently, along with your marker file. If it were Retain, the PV would sit in Released state indefinitely, costing money, invisible unless someone explicitly checks kubectl get pv. Neither behavior is a bug — but assuming the wrong one in either direction is a genuine production incident category: either "I thought deleting the StatefulSet would clean up storage costs and it didn't," or worse, "I thought deleting the StatefulSet would clean up storage and it silently destroyed data I needed."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
