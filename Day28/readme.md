@@ -1669,6 +1669,1440 @@ kubectl get pv   # check whether the PV (and underlying EBS volume) is gone or s
 
 **Debrief**: If the policy was Delete (typical default for dynamic StorageClasses), the PV and the real EBS volume are both gone now — permanently, along with your marker file. If it were Retain, the PV would sit in Released state indefinitely, costing money, invisible unless someone explicitly checks kubectl get pv. Neither behavior is a bug — but assuming the wrong one in either direction is a genuine production incident category: either "I thought deleting the StatefulSet would clean up storage costs and it didn't," or worse, "I thought deleting the StatefulSet would clean up storage and it silently destroyed data I needed."
 
+**Module 6 — Control Plane Failures (etcd / API Server / Controller-Manager)**
+
+You've already run real chaos labs against etcd, static pod corruption, network partitions, admission webhook lockout, and cgroup driver mismatch on this exact cluster — so this module builds underneath that hands-on experience rather than repeating it: the theory for why those failures manifested the way they did, plus new labs covering ground you haven't hit yet (including that apiserver TLS cert corruption lab you scoped but never ran).
+
+**The 'Why' (The Problem)**
+
+Distributed cluster state needs consensus — multiple things need to agree on "what is true right now" even when nodes fail or messages get delayed. Before Kubernetes, systems like Google's Borg solved this with a tightly-coupled, purpose-built consensus service (Chubby) baked into the orchestrator itself — every component that needed cluster state had to understand distributed-consensus semantics directly. Kubernetes made a deliberate architectural choice to avoid that: only one component, kube-apiserver, is ever allowed to talk to etcd. Every controller, every scheduler, every kubelet, every kubectl command only ever speaks a uniform REST+watch HTTP API to the API server. This means only one piece of the entire system needs to understand Raft consensus, watch resumption, and MVCC compaction — everything else just lists and watches objects through a simple interface. It's the exact same "isolate the hard distributed-systems problem behind one interface" pattern as CRI (Module 2) and CSI (Module 5), applied to state storage.
+
+**Deep-Dive Mechanics**
+
+**etcd is Raft consensus underneath a key-value store.** Every write goes through leader election and log replication, and requires a quorum — a majority, (N/2)+1 — of members to acknowledge before it's committed. This number matters enormously for you specifically: your troubleshooting cluster runs single-member, stacked etcd (colocated with the one control-plane node) — quorum there is trivially 1, meaning that one etcd instance is the entire consensus group. Lose it, and you have zero availability, instantly, with no failover possible. Your separate [[multi-region-kubeadm]] cluster runs external etcd with multiple members specifically so quorum survives a single node loss (3 members → quorum 2, tolerates 1 failure). Same software, radically different failure tolerance, purely from topology.
+
+**Watch + resourceVersion + compaction.** etcd is MVCC (multi-version concurrency control) — every write bumps a global monotonically-increasing revision, and old revisions are retained until compaction removes them. kube-apiserver's watches (and every controller's informer, and kubectl get --watch) work by listing at some revision, then asking to resume the watch stream from that resourceVersion. If a watcher falls far enough behind that etcd has already compacted past the revision it's asking for, it gets "too old resource version" — this is not data loss or corruption, it's an expected MVCC boundary condition, and the only correct response (which every well-written client does automatically) is a fresh List, not a repair action. Compaction itself only marks old revisions as reclaimable — it doesn't shrink the actual .db file on disk. That requires a separate defrag operation, which is I/O-intensive and, on a single-member cluster, briefly pauses that member entirely (in true multi-member HA, you defrag one member at a time so the others keep serving).
+
+**etcd's NOSPACE alarm is a real, cluster-halting failure mode.** etcd enforces a backend quota (default 2GB) via --quota-backend-bytes. Once the database hits that size, etcd raises a NOSPACE alarm and goes read-only cluster-wide — every write anywhere in the cluster fails, not just etcd-internal ones, because kube-apiserver's writes are etcd writes. Reads keep working (this is often the confusing part — the cluster looks "half-fine"). Recovery is a specific sequence: delete/reduce data → compact → defrag → explicitly disarm the alarm. Miss the disarm step and writes stay blocked even after space is reclaimed — the alarm doesn't self-clear.
+
+**API Priority and Fairness (APF)** replaced the old fixed --max-requests-inflight limit. Requests are bucketed into PriorityLevelConfigurations via FlowSchema rules matching on user/group/verb/resource, each with its own concurrency share and queue — this stops one noisy client (a buggy controller listing everything in a hot loop, a CI pipeline hammering the API) from starving critical traffic like kubelet heartbeats. A 429 Too Many Requests from the API server usually means APF rejected the request due to queue exhaustion at that client's priority level — not general server overload. Important nuance: kubectl running as your normal kubeadm admin identity is typically in the system:masters group, which the default APF config binds to the exempt priority level — meaning your own admin kubectl commands are usually not throttled by APF at all. Real APF incidents are almost always a specific service account or automated client, not admin traffic.
+
+**Static pod failure modes split into two completely different diagnostic paths** (this connects directly to your existing static-pod-corruption chaos lab, one level deeper): if a manifest in /etc/kubernetes/manifests/ is syntactically invalid YAML, kubelet can't even parse it into a Pod object — it logs a parse error to its own journal and never attempts to run anything. crictl ps -a will show nothing at all for that component. If the manifest is valid YAML but semantically wrong (bad flag, wrong path), kubelet successfully creates the Pod object and hands it to the container runtime, which genuinely tries and fails — crictl ps -a will show a container, crash-looping, and crictl logs will have the real error. Same top-level symptom ("this component isn't running"), completely different place to look, and you can tell which case you're in within seconds just by checking whether crictl ps -a shows anything.
+
+**The recursive problem:** if kube-apiserver itself is down (crashed static pod, expired/corrupted serving cert), kubectl cannot help you diagnose it — the tool you'd reach for is unavailable precisely because of the thing you're trying to diagnose. This is the single most senior-differentiating scenario in this whole module: you have to already know the SSH-in, crictl/journalctl-direct path cold, because you cannot discover it live while the system that would normally teach you is the thing that's broken.
+
+**Leader election** for controller-manager and scheduler uses Lease objects (coordination.k8s.io, not the older ConfigMap-annotation mechanism) — kubectl -n kube-system get lease shows holderIdentity for each. On a true multi-control-plane cluster, losing the active holder triggers another instance to acquire the lease within seconds. On your single-control-plane cluster, there is no standby to fail over to — losing controller-manager doesn't cause errors anywhere, it just means nothing gets reconciled (no new ReplicaSets from Deployments, no new Pods from ReplicaSets, no anything) until it comes back, silently.
+
+**The Alternative Landscape**
+
+<img width="872" height="527" alt="image" src="https://github.com/user-attachments/assets/619b8bba-6564-4a0a-8fe4-6112da5b5b08" />
+
+<img width="842" height="287" alt="image" src="https://github.com/user-attachments/assets/3e757049-9c52-4782-9a65-d0454acb7790" />
+
+You're running stacked etcd here specifically because it's the simplest path to a working learning cluster; your separate external-etcd cluster exists specifically to practice the production-grade pattern once blast-radius isolation actually matters. Companies like Booking or Adyen running self-managed clusters would default to external etcd for exactly the isolation reason in the table; most companies today just default to a managed control plane entirely and only manage etcd/apiserver themselves where compliance or cost genuinely demands it.
+
+**Interview POV & Edge Cases**
+
+The signature senior-level prompt here: "kubectl is completely unresponsive — walk me through diagnosing a control plane outage with your normal tooling unavailable." They're checking whether you reflexively reach for SSH + crictl/journalctl rather than freezing because "the tool I'd normally use is the thing that's broken." Expected order: SSH to the control-plane node → check manifest files are valid YAML → check kubelet's own journal → crictl ps -a for the relevant static pod containers → crictl logs on anything crash-looping → check cert validity directly with openssl x509 -in ... -noout -dates if TLS is suspected.
+
+**Gotchas**:
+
+- Reading a 429 as "the cluster needs more capacity" instead of checking apiserver_flowcontrol_rejected_requests_total and the actual FlowSchema involved — scaling nodes fixes nothing here, since it's a fairness/queueing problem, not a resource problem.
+- Treating "too old resource version" as data corruption and trying to "fix" etcd, when it's just an expected MVCC boundary the client resolves itself via re-list.
+- Forgetting the explicit alarm disarm step after clearing a NOSPACE condition — space reclaimed, writes still blocked, because the alarm doesn't self-clear.
+- Assuming system:masters/admin kubectl traffic is subject to the same throttling as everything else — it's typically exempt, which is exactly why real APF incidents trace back to a service account or automated client, not a human running kubectl too fast.
+- Assuming controller-manager/scheduler restarts are always harmless because "that's what leader election is for" — true in real HA, false and directly disruptive on any single-control-plane cluster, including this one.
+
+**The 'Better Way' (Evolution)**
+
+Managed control planes (EKS/GKE/AKS) exist specifically to remove this entire failure category from a platform team's plate — multi-AZ etcd, automatic apiserver failover, no one SSHing into a control-plane node ever. That's a genuine trade-off worth naming honestly: you give up deep operational control (and the exact debugging reflexes this module builds) in exchange for eliminating the failure category outright. It's also why this material still matters even if you're targeting EKS-heavy shops — APF throttling, admission webhook failures, and watch-resync behavior all still surface at the API-server level regardless of who's operating etcd underneath, and interviewers know the difference between someone who's only ever seen a managed control plane and someone who's actually broken one on purpose.
+
+**Module 6 Lab Pack**
+
+<img width="887" height="463" alt="image" src="https://github.com/user-attachments/assets/08a3acf7-2c3e-4fd3-aff9-32b8fd4ff697" />
+
+**Before starting: sudo cp -r /etc/kubernetes/pki /etc/kubernetes/pki.bak and sudo cp -r /etc/kubernetes/manifests /tmp/manifests.bak** — every lab in this module touches control-plane internals directly; always have a known-good copy one command away.
+
+**Lab 1 — Corrupted API Server TLS Certificate**
+
+**Break**
+
+```
+bash
+# ON THE MASTER NODE — you already backed up pki above
+sudo truncate -s 0 /etc/kubernetes/pki/apiserver.crt
+```
+
+**Predict**: Will any kubectl command still work after this, from anywhere?
+
+**Diagnose** — from wherever your kubeconfig normally works:
+
+```
+bash
+kubectl get nodes
+```
+
+Expect total failure — a TLS handshake error, not a normal Kubernetes error message. Now the recursive part — you have to go around kubectl entirely:
+
+```
+bash
+# back on the master, over SSH
+sudo crictl ps -a | grep apiserver
+sudo crictl logs <apiserver-container-id>
+```
+
+Expect the container crash-looping, and the log showing a certificate-loading failure.
+
+**Fix**
+
+```
+bash
+sudo cp /etc/kubernetes/pki.bak/apiserver.crt /etc/kubernetes/pki/apiserver.crt
+sudo crictl ps -a | grep apiserver -w
+kubectl get nodes
+```
+
+**Debrief**: This is the lab your chaos-lab notes scoped but never ran — worth having actually done it now. Note what real-world cert expiry (rather than corruption) looks like preventively: sudo kubeadm certs check-expiration lists every cert's remaining validity, and sudo kubeadm certs renew all regenerates them (static pods need to restart afterward to pick up the new files — moving the manifest out and back, or a kubelet restart, forces that). The failure signature at TLS-handshake level is identical whether the cert is corrupted or genuinely expired — which is exactly why "everything just stopped working, no config changed" is the classic tell of an expired cert, not a Kubernetes bug.
+
+**Lab 2 — Static Pod: Syntax Error vs. Semantic Error**
+
+**Break — Part A (syntax error, guaranteed invalid YAML)**
+
+```
+bash
+sudo cp /etc/kubernetes/manifests/etcd.yaml /tmp/etcd.yaml.bak
+sudo sed -i '1i @@@INVALID_YAML@@@' /etc/kubernetes/manifests/etcd.yaml
+```
+
+**Predict**: Will crictl ps -a show an etcd container attempting (and failing) to start, or nothing at all?
+
+**Diagnose**
+
+```
+bash
+sudo journalctl -u kubelet --no-pager | tail -30
+sudo crictl ps -a | grep etcd
+```
+
+Expect a parse error in kubelet's own journal, and nothing in crictl ps -a — kubelet never got far enough to attempt a container. Since etcd is now down, watch the API server start failing shortly after too (cascading dependency).
+
+**Fix**
+
+```
+bash
+sudo cp /tmp/etcd.yaml.bak /etc/kubernetes/manifests/etcd.yaml
+sudo crictl ps -a | grep etcd -w
+kubectl get nodes
+```
+
+**Break — Part B (semantically wrong, valid YAML)**
+
+```
+bash
+sudo cp /etc/kubernetes/manifests/etcd.yaml /tmp/etcd.yaml.bak2
+sudo sed -i 's#--data-dir=/var/lib/etcd#--data-dir=/nonexistent/path#' /etc/kubernetes/manifests/etcd.yaml
+```
+
+**Predict**: Same absence in crictl ps -a as Part A, or different?
+
+**Diagnose**
+
+```
+bash
+sudo crictl ps -a | grep etcd
+sudo crictl logs <etcd-container-id>
+```
+
+This time crictl ps -a does show a container — crash-looping — with a real startup error about the bad path in its logs.
+
+**Fix**
+
+```
+bash
+sudo cp /tmp/etcd.yaml.bak2 /etc/kubernetes/manifests/etcd.yaml
+```
+
+**Debrief:** This pair is the whole lesson from the Deep-Dive made concrete: identical top-level symptom ("etcd isn't running"), and crictl ps -a alone tells you instantly which diagnostic path you're on — empty means go to the kubelet journal, populated-and-crash-looping means go to crictl logs. Checking crictl ps -a first, before anything else, is the single fastest triage step for any static pod failure.
+
+**Lab 3 — etcd NOSPACE Alarm**
+
+Work as root for this lab and set up etcdctl once:
+
+```
+bash
+sudo -i
+export ETCDCTL_API=3
+export ETCDCTL_ARGS="--endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key"
+etcdctl $ETCDCTL_ARGS endpoint status --write-out=table
+```
+
+**Break** — lower the quota so you don't have to wait for 2GB of real growth:
+
+```
+bash
+cp /etc/kubernetes/manifests/etcd.yaml /tmp/etcd.yaml.bak3
+sed -i '/- etcd/a\    - --quota-backend-bytes=16777216' /etc/kubernetes/manifests/etcd.yaml
+# wait for etcd to restart with the new flag, then confirm:
+crictl ps | grep etcd
+```
+
+Now flood it (exit root shell only for the kubectl part, or run kubectl with --kubeconfig=/etc/kubernetes/admin.conf while still root):
+
+```
+bash
+for i in $(seq 1 300); do
+  kubectl --kubeconfig=/etc/kubernetes/admin.conf create configmap flood-$i \
+    --from-literal=data="$(head -c 50000 /dev/urandom | base64)" -n default >/dev/null 2>&1
+done
+```
+
+**Predict**: Once the quota trips, will reads still work? Writes to totally unrelated objects?
+
+**Diagnose**
+
+```
+bash
+etcdctl $ETCDCTL_ARGS alarm list
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get configmap flood-1   # reads
+kubectl --kubeconfig=/etc/kubernetes/admin.conf create configmap unrelated-test --from-literal=x=1   # writes
+```
+
+Expect alarm list showing NOSPACE; reads succeed; every write cluster-wide fails, including this totally unrelated ConfigMap, with an mvcc: database space exceeded error.
+
+**Fix**
+
+```
+bash
+for i in $(seq 1 300); do
+  kubectl --kubeconfig=/etc/kubernetes/admin.conf delete configmap flood-$i -n default >/dev/null 2>&1
+done
+REV=$(etcdctl $ETCDCTL_ARGS endpoint status --write-out=json | grep -o '"revision":[0-9]*' | head -1 | cut -d: -f2)
+etcdctl $ETCDCTL_ARGS compact $REV
+etcdctl $ETCDCTL_ARGS defrag
+etcdctl $ETCDCTL_ARGS alarm disarm
+# restore the real quota
+cp /tmp/etcd.yaml.bak3 /etc/kubernetes/manifests/etcd.yaml
+exit   # leave root shell
+```
+
+**Debrief**: Notice writes stayed blocked even right after compact — because compact only marks old revisions reclaimable, it doesn't shrink the file, and more importantly the alarm itself doesn't clear on its own even once space genuinely is reclaimed. disarm is a separate, easy-to-forget step, and skipping it is a real "why is my cluster still read-only, I already cleaned everything up" incident.
+
+**Lab 4 — Forcing "too old resource version" Deterministically**
+
+```
+bash
+sudo -i
+export ETCDCTL_API=3
+export ETCDCTL_ARGS="--endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key"
+CURRENT_REV=$(etcdctl $ETCDCTL_ARGS endpoint status --write-out=json | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['Status']['header']['revision'])")
+echo "Watching from revision: $CURRENT_REV"
+```
+
+**Predict**: If you compact etcd past this revision and then ask it to resume a watch from $CURRENT_REV, what happens?
+
+**Break**
+
+```
+bash
+etcdctl $ETCDCTL_ARGS put demo-key demo-value
+NEW_REV=$(etcdctl $ETCDCTL_ARGS endpoint status --write-out=json | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['Status']['header']['revision'])")
+etcdctl $ETCDCTL_ARGS compact $NEW_REV
+```
+
+**Diagnose**
+
+```
+bash
+etcdctl $ETCDCTL_ARGS watch --rev=$CURRENT_REV demo-key
+```
+
+Expect an immediate error: mvcc: required revision has been compacted.
+
+**Fix:** nothing to fix — clean up and relate it back to the K8s layer:
+
+```
+bash
+etcdctl $ETCDCTL_ARGS del demo-key
+exit
+bash
+kubectl get pods --watch   # this is the exact client-side mechanism — if it ever falls this far behind, it just re-lists automatically
+```
+
+**Debrief:** You just reproduced, deterministically and at the source, the exact condition behind "too old resource version" from a stalled kubectl get --watch or a controller's informer resync. It's not corruption, not data loss — it's MVCC's compaction boundary doing exactly what it's designed to do. The correct reaction to seeing this in the wild is "the watcher will re-list, this is expected," never "something is wrong with etcd."
+
+**Lab 5 — Killing controller-manager on a Single Control Plane**
+
+```
+bash
+kubectl -n kube-system get lease
+kubectl -n kube-system get lease kube-controller-manager -o yaml | grep holderIdentity
+```
+
+**Predict:** With only one control-plane node, what happens to a brand-new Deployment if controller-manager isn't running?
+
+**Break**
+
+```
+bash
+sudo crictl ps | grep kube-controller-manager
+sudo crictl stop <container-id>
+```
+
+**Diagnose**
+
+```
+bash
+kubectl create deployment leader-test --image=nginx --replicas=3
+kubectl get deployment leader-test
+kubectl get replicaset -l app=leader-test
+kubectl get pods -l app=leader-test
+```
+
+The Deployment object itself is created instantly (that's just an API server write). No ReplicaSet ever appears — that reconciliation is specifically controller-manager's job, and it isn't running.
+
+**Fix**
+
+```
+bash
+sudo crictl ps -a | grep kube-controller-manager   # kubelet should already be restarting the static pod
+kubectl get replicaset -l app=leader-test -w   # watch it appear the instant controller-manager is back
+```
+
+**Debrief:** Deployment → ReplicaSet → Pod normally happens so fast you never see the gap between the steps — this lab makes it visible by holding one step open. In a true multi-control-plane cluster, holderIdentity on that Lease would flip to a standby within seconds and you'd likely never notice. Here, on this exact single-master setup, everything downstream of controller-manager simply stops — silently, with zero error surfaced anywhere — until it restarts. This is precisely the gap your external-etcd, presumably-eventually-multi-control-plane cluster exists to close.
+
+**Lab 6 — APF Throttling via a Constrained ServiceAccount**
+
+```
+bash
+kubectl get flowschemas
+kubectl get prioritylevelconfigurations
+```
+
+**Break** — create a low-privileged identity (your admin kubeconfig is almost certainly exempt from APF, so testing as yourself would show nothing):
+
+```
+bash
+kubectl create serviceaccount apf-test
+kubectl create clusterrolebinding apf-test-view --clusterrole=view --serviceaccount=default:apf-test
+TOKEN=$(kubectl create token apf-test --duration=1h)
+APISERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+```
+
+**Predict**: Firing a large burst of concurrent raw requests as this constrained identity — what response code do you expect once its priority level's concurrency share is exhausted?
+
+```
+bash
+for i in $(seq 1 100); do
+  curl -sk -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $TOKEN" \
+    "$APISERVER/api/v1/namespaces/default/pods" &
+done
+wait | sort | uniq -c
+```
+
+(Using raw curl in parallel deliberately bypasses kubectl's own client-side rate limiting, which would otherwise smooth this out.)
+
+**Diagnose**
+
+```
+bash
+kubectl get --raw /metrics | grep apiserver_flowcontrol_rejected_requests_total
+```
+
+Expect a mix of 200s and 429s in the burst, and a non-zero, incrementing rejection counter — direct confirmation this is APF fairness throttling, not general server overload.
+
+**Fix / cleanup**
+
+```
+bash
+kubectl delete clusterrolebinding apf-test-view
+kubectl delete serviceaccount apf-test
+```
+
+**Debrief**: This is the accurate version of a scenario people often get wrong in interviews — your own admin kubectl traffic is typically exempt from APF entirely via the system:masters group binding, so a real 429 incident is almost never "the cluster is overloaded, add nodes." It's a specific service account, operator, or CI client hammering the API within its own priority level's queue. The fix lives in FlowSchema/PriorityLevelConfiguration tuning or fixing the offending client's request pattern — not capacity.
+
+**Module 7 — Node-Level Failures (kubelet Internals & OS/cgroup Pressure)**
+
+Everything so far has been Kubernetes-object-level troubleshooting. This module goes one floor further down — to the actual Linux node underneath. This is also where your cgroup driver mismatch chaos lab lives conceptually; we'll go deeper into why that failure class exists at all.
+
+**The 'Why' (The Problem)**
+
+Early container orchestration mostly assumed nodes were healthy, roughly-infinite resource pools — a pod just "stopped," with no systematic signal distinguishing "this pod's manifest is wrong" from "the node it's on is dying." That's a dangerous gap: a single leaking pod could exhaust a node's memory or disk and silently take every other pod on that node down with it, with nothing in any pod's own describe output hinting at the real cause. Kubernetes needed two things: a systematic way for kubelet to observe and report actual OS-level health (Node Conditions), and a systematic way to protect a node from any one workload's misbehavior before it becomes a total node failure (the eviction manager, driven by QoS classes). Node-level failures are exactly the failures that don't show up when you describe a pod — you have to know to look at the node instead.
+
+**Deep-Dive Mechanics**
+
+**Node Conditions and the two-tier heartbeat.** kubelet continuously polls OS-level metrics (via its embedded cAdvisor) and reports them as Node Conditions: Ready, MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable. There are actually two separate heartbeat mechanisms: a full NodeStatus update (relatively infrequent — expensive, since it's a full object write to etcd) and a lightweight Lease object heartbeat (frequent, cheap, roughly every 10s) that the node-lifecycle-controller actually watches to decide node health quickly. This split exists purely for cost — writing a full node status object to etcd every few seconds across a large fleet would be wasteful; the cheap Lease heartbeat gives fast failure detection without that cost.
+
+**QoS class is computed, not declared** — you never set it directly, kubelet derives it from your resource spec:
+
+- Guaranteed: every container has requests == limits for both CPU and memory.
+- Burstable: has requests, but they don't match limits (or only some containers/resources specify them).
+- BestEffort: no requests or limits at all, anywhere.
+
+This classification directly sets each pod's oom_score_adj and eviction priority — BestEffort is evicted/OOM-killed first, Guaranteed is protected most, Burstable scales in between based on how far actual usage exceeds its requested amount.
+
+**The eviction manager is a kubelet decision, distinct from scheduler preemption (Module 3)**. Preemption happens before placement, on the scheduler, deciding who gets a node. Eviction happens on an already-running pod, decided locally by the kubelet on the node that's under pressure, once a Node Condition trips a configured threshold (soft thresholds have a grace period; hard thresholds evict immediately). kubelet ranks victims by: is usage exceeding requests, then QoS class, then priority — not by which pod actually caused the pressure. This is the source of a very common, very confusing incident: an innocent BestEffort pod gets evicted while the real memory hog (a Burstable pod using far more than it requested) survives, simply because QoS class outranks "who's responsible" in the eviction algorithm.
+
+**cgroup driver mismatch, one level deeper than your chaos lab.** The kernel's cgroup subsystem needs exactly one manager. If kubelet is configured for cgroupfs while the container runtime (containerd) or the OS init system (systemd) expects systemd to own cgroups, you get two systems independently trying to manage the same resource hierarchy — inconsistent accounting, resource limits silently not applying correctly, and on cgroup v2-only kernels (the current default on modern Ubuntu), systemd as the driver is effectively required, not optional. This is exactly the mismatch your existing chaos lab reproduced; the underlying reason it matters is that kubelet and the runtime have to agree on who is authoritative for the exact same kernel data structures.
+
+**Automatic taint-based node eviction — the real mechanism behind Module 3's manual NoExecute lab**. When a node misses its Lease heartbeats past node-monitor-grace-period (default ~40s), the node-lifecycle-controller automatically applies node.kubernetes.io/not-ready:NoExecute (or ...unreachable:NoExecute) — the exact same taint type you applied by hand in Module 3. Pods don't get evicted instantly even then: the built-in default tolerationSeconds for these specific taints is 300 seconds (5 minutes), unless a pod explicitly overrides it. This is the real answer to "why does failover take 5 minutes on a perfectly healthy multi-node cluster" — it's not a bug or slow detection, it's this specific, deliberate default giving a flapping node a grace window to recover before Kubernetes starts evicting everything on it.
+
+**PLEG health is itself a node-readiness signal,** not just a pod-lifecycle detail (Module 2 mentioned this briefly — here's the full picture). If kubelet's PLEG relist loop can't get timely responses from the container runtime, kubelet marks itself unhealthy internally and the node goes NotReady — even though the kubelet process is fully alive. ps aux | grep kubelet showing a running process tells you nothing about whether kubelet can actually do its job.
+
+**Kernel-level failure surfaces beyond cgroups,** each with its own non-obvious signature:
+
+- Inode exhaustion is distinct from disk space exhaustion — a filesystem can show plenty of free bytes (df -h) while being 100% out of inodes (df -i) if it's littered with huge numbers of tiny files. DiskPressure actually monitors both independently.
+- Clock skew breaks TLS certificate validity windows and Raft timing assumptions — and the resulting failure looks exactly like a PKI problem (Module 6), not a clock problem, unless you specifically check the system clock.
+- conntrack table exhaustion (nf_conntrack_max) causes the kernel to silently drop packets once the connection-tracking table fills — no Kubernetes object anywhere reflects this; it only shows up in dmesg.
+
+**The Alternative Landscape**
+
+<img width="901" height="581" alt="image" src="https://github.com/user-attachments/assets/ac72f852-76af-460b-ad9c-ff2e9ab2bf8f" />
+
+None of these replace kubelet's own eviction manager — it's the always-on last line of defense. You'd add a descheduler when workloads correctly start well-placed but drift into imbalance over time; VPA when the actual root cause is chronically wrong resource requests rather than genuine unpredictable spikes; and NPD when you need to catch hardware-level node rot before it manifests as an actual Kubernetes-visible symptom at all — this is standard on GKE and increasingly common as a self-managed DaemonSet elsewhere.
+
+**Interview POV & Edge Cases**
+
+Classic prompt: "A node goes NotReady intermittently under load — walk me through it." The layered answer: check Node Conditions first (kubectl describe node) — which one tripped; check kubelet's own journal for PLEG is not healthy or similar internal loop errors, not just "is the process running"; check actual OS-level pressure directly (free -h, and critically df -i alongside df -h, and conntrack -C against nf_conntrack_max); and factor in the ~40s detection grace period plus the 300s default toleration before assuming something's abnormally slow.
+
+**Gotchas**:
+
+- df -h showing free space while the node is genuinely under DiskPressure from inode exhaustion — checking only one of the two is a real, common miss.
+- Assuming the pod that got evicted during a MemoryPressure event is the pod that caused it — eviction order follows QoS class and usage-over-request ratio, not culpability; the actual offender (often Burstable, using more than requested but less than its generous limit) can survive while an innocent BestEffort pod nearby gets killed.
+- Treating the 300-second default failover delay as a symptom of something broken, when it's a deliberate built-in tolerationSeconds default protecting against flapping nodes.
+- "kubelet is running" ≠ "node is healthy" — PLEG failures or a stuck container runtime can leave the process alive while kubelet is functionally unable to do its job.
+- Chasing a confusing TLS/certificate error for several minutes (Module 6 territory) when the actual root cause is a clock five minutes off, discoverable in ten seconds with timedatectl status.
+
+**The 'Better Way' (Evolution)**
+
+Autoscaler-integrated node health checks (Karpenter and similar) increasingly terminate and replace visibly unhealthy nodes proactively rather than waiting for kubelet's own slow-to-surface conditions to fully develop. Node Problem Detector plus an automatic remedy system (GKE's automatic node repair is the canonical example) watches kernel/journald signals directly and drains+replaces before a Kubernetes-level condition even trips. VPA addresses the underlying resource-misestimation that causes most pressure events in the first place, rather than reacting after the fact. And at the observability layer, node-level eBPF tooling (Cilium/Pixie again — this keeps coming up because it genuinely is the modern answer to "invisible to kubectl") gives direct visibility into kernel-level exhaustion — conntrack fill, socket exhaustion — that no kubectl command surfaces at all.
+
+**Module 7 Lab Pack**
+
+<img width="873" height="430" alt="image" src="https://github.com/user-attachments/assets/474530aa-97c8-4324-aa17-0b3e7924a2d2" />
+
+**Lab 1 — Inode Exhaustion (DiskPressure Without Low Disk Space)**
+
+**Break (SSH to a worker)**
+
+```
+df -h /   # note free space — should look fine throughout this lab
+df -i /   # note free inodes
+sudo mkdir -p /tmp/inode-flood
+i=0
+while true; do
+  i=$((i+1))
+  sudo touch /tmp/inode-flood/f$i
+  if [ $((i % 10000)) -eq 0 ]; then
+    USE=$(df -i / | awk 'NR==2{print $5}' | tr -d '%')
+    echo "created $i files, inode use: $USE%"
+    [ "$USE" -ge 90 ] && break
+  fi
+done
+```
+
+**Predict**: Will df -h and df -i on this node tell the same story?
+
+**Diagnose** (from master)
+
+```
+bash
+kubectl describe node <that-worker> | grep -A5 Conditions
+```
+
+**Expect DiskPressure**: True even though df -h on the node itself still shows plenty of free bytes — kubelet monitors nodefs.inodesFree as an entirely separate signal from nodefs.available.
+
+**Fix**
+
+```
+bash
+# on the worker
+sudo rm -rf /tmp/inode-flood
+df -i /
+bash
+kubectl describe node <that-worker> | grep -A5 Conditions   # confirm DiskPressure clears
+```
+
+**Debrief**: Checking df -h alone and concluding "disk isn't the problem" is a genuinely common near-miss — this scenario (huge counts of tiny files: logs, temp lease files, small cache entries) is realistic, not contrived, and the fix requires checking -i specifically, which most people don't reach for by habit.
+
+**Lab 2 — MemoryPressure + QoS-Based Eviction Ordering**
+
+First check the target node's real capacity so you size the "hog" correctly:
+
+```
+bash
+kubectl describe node <worker-1> | grep -A3 Allocatable
+kubectl label node <worker-1> pressure-test=true
+```
+
+**Break** — three pods, three QoS classes, one node. Adjust vm-bytes below to roughly 70-80% of that node's allocatable memory:
+
+```
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: guaranteed-pod
+spec:
+  nodeSelector: {pressure-test: "true"}
+  containers:
+  - name: g
+    image: nginx
+    resources:
+      requests: {cpu: "100m", memory: "200Mi"}
+      limits: {cpu: "100m", memory: "200Mi"}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: besteffort-pod
+spec:
+  nodeSelector: {pressure-test: "true"}
+  containers:
+  - name: b
+    image: nginx
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: burstable-hog
+spec:
+  nodeSelector: {pressure-test: "true"}
+  containers:
+  - name: hog
+    image: polinux/stress
+    resources:
+      requests: {memory: "100Mi"}
+      limits: {memory: "1500Mi"}
+    args: ["stress", "--vm", "1", "--vm-bytes", "1200M", "--vm-hang", "0"]
+EOF
+```
+
+**Predict**: When MemoryPressure trips, which pod gets evicted first — the hog that's actually causing it, the innocent bystander, or neither?
+
+**Diagnose**
+
+```
+bash
+kubectl describe node worker-1 | grep -A5 Conditions
+kubectl get pods -o wide -w
+```
+
+Expect besteffort-pod evicted first (Status: Evicted), while burstable-hog — the actual cause — and guaranteed-pod both survive, at least initially.
+
+**Fix**
+
+```
+kubectl delete pod burstable-hog guaranteed-pod besteffort-pod
+kubectl label node worker-1 pressure-test-
+```
+
+**Debrief**: This is exactly the "who gets blamed vs. who's actually guilty" gap from the Deep-Dive, made visible. In a real incident, seeing an evicted BestEffort pod and assuming it was the problem — rather than checking which pod's actual usage was driving the pressure — sends you investigating the wrong workload.
+
+**Lab 3 — PID Exhaustion**
+
+```
+bash
+kubectl label node worker-1 pressure-test=true
+cat /proc/sys/kernel/pid_max   # on worker-1 — total system PID space
+```
+
+**Break**
+
+```
+bash
+kubectl run pid-hog --image=busybox --restart=Never \
+  --overrides='{"spec":{"nodeSelector":{"pressure-test":"true"},"containers":[{"name":"pid-hog","image":"busybox","command":["sh","-c","for i in $(seq 1 20000); do sleep 1000 & done; wait"]}]}}'
+```
+
+**Predict:** Will this hit a per-pod limit first, or exhaust the node's entire PID space?
+
+**Diagnose**
+
+```
+kubectl describe node worker-1 | grep -A5 Conditions
+kubectl describe pod pid-hog | tail -20
+```
+
+One of two outcomes, both instructive: if a per-pod PID limit (PodPidsLimit/--pod-max-pids) is configured, pid-hog alone fails once it hits its own cgroup's pids.max — the node stays fine, exactly as designed. If no such limit is configured (common in a vanilla kubeadm install), you may see PIDPressure: True on the node itself.
+
+**Fix**
+
+```
+kubectl delete pod pid-hog
+```
+
+**Debrief**: PID space is finite in a way most engineers don't intuitively track the way they track memory or disk — and unlike those, exhausting it affects every process on the node, including kubelet and the container runtime itself. Whether this lab stayed contained to one pod or affected the whole node tells you directly whether your cluster has per-pod PID limiting configured — worth checking explicitly rather than assuming.
+
+**Lab 4 — kubelet Stopped → Automatic NoExecute Taint → 300s Default Failover**
+
+```
+bash
+kubectl label node worker-1 pressure-test-   # clean up from earlier labs
+kubectl create deployment failover-test --image=nginx --replicas=1
+kubectl get pod -l app=failover-test -o wide   # note the node
+```
+
+**Break (SSH to that node)**
+
+```
+sudo systemctl stop kubelet
+```
+
+**Predict**: Time how long each of these takes, from the moment kubelet stops — node NotReady, the automatic taint appearing, and the pod actually being rescheduled.
+
+**Diagnose** (from master, with timestamps)
+
+```
+bash
+date; kubectl get nodes -w   # note the moment it flips to NotReady
+kubectl describe node <that-node> | grep -A3 Taints   # watch for node.kubernetes.io/not-ready:NoExecute
+kubectl get pod -l app=failover-test -o wide -w   # watch for eviction + reschedule onto the other worker
+```
+
+Expect roughly: NotReady ~40s after the last heartbeat, the NoExecute taint applied automatically at essentially the same moment, but the pod itself doesn't actually move until ~300s later.
+
+**Fix**
+
+```
+# on the original node
+sudo systemctl start kubelet
+```
+
+**Debrief**: This connects Module 3's manual NoExecute taint lab and Module 6's Lease-based leader election lab into one real, automatic incident: the node-lifecycle-controller is watching the exact same Lease heartbeats controller-manager's own election relies on, applying the exact same taint type you applied by hand earlier, gated by the exact same 300-second default toleration. "Why did failover take 5 minutes" stops being mysterious once you've watched all three pieces fire in sequence with your own timestamps.
+
+**Lab 5 — Clock Skew Masquerading as a PKI Problem**
+
+**Break** (SSH to a worker — restore promptly, this affects everything else running on the node while active)
+
+```
+timedatectl status   # note current sync state before you start
+sudo timedatectl set-ntp false
+sudo date -s "2027-01-01 00:00:00"
+```
+
+**Predict**: Will the resulting error, wherever it surfaces, mention "time" or "clock" anywhere — or will it look like an entirely different category of problem?
+
+**Diagnose**
+
+```
+kubectl get nodes   # from master — this node may show NotReady or a communication error
+sudo journalctl -u kubelet --no-pager | tail -30   # on the worker
+```
+
+Expect kubelet's client certificate to fail validation against the API server — the error text reads like a TLS/certificate problem (echoing Module 6 Lab 1), with nothing pointing at the clock directly.
+
+**Fix**
+
+```
+sudo timedatectl set-ntp true
+sudo systemctl restart systemd-timesyncd
+timedatectl status   # confirm "System clock synchronized: yes"
+
+kubectl get nodes -w
+```
+
+**Debrief**: This is deliberately one of the most disorienting failures in the whole masterclass — the symptom actively misdirects you toward PKI troubleshooting when the real fix is one date command away. timedatectl status is worth being a genuinely early, cheap check whenever you see unexplained cert/auth failures with no corresponding config change anywhere.
+
+**Lab 6 — conntrack Table Exhaustion (Kernel-Level, Invisible to kubectl)**
+
+```
+kubectl label node worker-1 pressure-test=true
+# on worker-1
+sysctl net.netfilter.nf_conntrack_max
+sysctl net.netfilter.nf_conntrack_count
+```
+
+**Break** — lower the ceiling so it's easy to exhaust without generating enormous real traffic (note the original value above so you can restore it):
+
+```
+sudo sysctl -w net.netfilter.nf_conntrack_max=256
+
+kubectl run conntrack-flood --image=nicolaka/netshoot --restart=Never \
+  --overrides='{"spec":{"nodeSelector":{"pressure-test":"true"}}}' -- sleep 3600
+kubectl exec conntrack-flood -- sh -c 'for i in $(seq 1 500); do (curl -s -o /dev/null -m1 http://1.1.1.1 &); done; sleep 5'
+```
+
+**Predict**: Once the table fills, do new connections get a clear error, or something else?
+
+**Diagnose**
+
+```
+bash
+# on worker-1
+dmesg | grep -i conntrack   # look for "nf_conntrack: table full, dropping packet"
+kubectl exec conntrack-flood -- curl -sm2 -o /dev/null -w "%{http_code} %{time_total}\n" http://1.1.1.1
+```
+
+Expect a silent hang/timeout with no informative error, and the real cause visible only in dmesg — nowhere in any Kubernetes object.
+
+**Fix**
+
+```
+sudo sysctl -w net.netfilter.nf_conntrack_max=262144   # or your originally noted value
+kubectl delete pod conntrack-flood
+kubectl label node worker-1 pressure-test-
+```
+
+**Debrief**: This is the deepest-in-the-stack failure in the entire masterclass so far — completely invisible to kubectl, to CoreDNS logs, to kube-proxy, to every Node Condition. At genuinely high pod density or connection churn (a busy proxy, a high-QPS service), nf_conntrack_max is a real, recurring node-level sysctl tuning knob that has nothing to do with any Kubernetes object at all — the kind of thing that only shows up once you already know to check kernel logs on the node itself.
+
+**Module 8 — Ingress/Gateway API & App-Layer Failures**
+
+This is where every earlier module's failures ultimately surface — a scheduling problem, a broken readiness probe, a stuck CSI volume, a resource-starved node all eventually show up here as the same-looking generic HTTP error at the edge. This module is as much about disciplined triage direction as new mechanics. And since you've already got Gateway API + Envoy Gateway + cert-manager running for real on this cluster, we'll teach Gateway API primary throughout, with Ingress alongside it for contrast — not the other way around.
+
+**The 'Why' (The Problem)**
+
+Before Ingress existed, exposing an HTTP service externally meant Service type: LoadBalancer — and every single service needing external access provisioned its own cloud load balancer. No shared L7 routing, no path-based fan-out, no centralized TLS termination — just cost and complexity multiplying linearly with service count. Ingress fixed that: one object type describing host/path routing rules, implemented by a shared controller fronting many backend Services behind a single IP and a single place to manage certificates.
+
+But Ingress's core spec only really standardizes basic host+path matching. Anything beyond that — weighted traffic splitting, header-based routing, cross-namespace routing restrictions — required proprietary, controller-specific annotations: nginx.ingress.kubernetes.io/... means nothing to the AWS Load Balancer Controller, which has its own entirely different annotation vocabulary. Ingress manifests that look "standard" are quietly non-portable, and complex routing logic devolves into annotation soup nothing type-checks. Gateway API was built specifically to fix this: a properly structured, typed, role-oriented API — GatewayClass / Gateway / HTTPRoute (and GRPCRoute, TCPRoute, etc.) — where the things Ingress could only express via magic strings are now real, validated fields. It also explicitly models something Ingress never did: who owns which layer of the config, matching how platform teams and app teams actually divide responsibility.
+
+**Deep-Dive Mechanics**
+
+**The object chain, and the single most common early mistake.** Neither Ingress nor Gateway API objects do anything by themselves — they're pure declarative intent, sitting inert in etcd until a controller watches and implements them. Ingress: Ingress → matched by IngressClass → an actual Ingress Controller (not part of core Kubernetes — ingress-nginx, ALB controller, etc., installed separately) → backend Service → pod endpoints. Gateway API: HTTPRoute → parentRef → Gateway → GatewayClass → the controller that implements that class (Envoy Gateway, in your case). Creating either object with no matching class/controller installed is accepted silently by the API server — no error, no rejection, it just sits there permanently doing nothing. This is the Gateway-API-equivalent of Module 1's "no controller watching" gap, and it's the very first thing to rule out whenever routing "isn't working" with no obvious error anywhere.
+
+**Gateway API's three-tier role separation is the actual architectural point, not just extra objects:**
+
+- GatewayClass — cluster-scoped, infra/platform-team owned, declares which controller implements it (Envoy Gateway).
+- Gateway — a specific listener instance: ports, protocols (HTTP/HTTPS/TLS/TCP), hostnames, TLS cert references. Typically one or a few per cluster or team, platform-owned.
+- HTTPRoute — app-team owned, lives in the app's own namespace, references a Gateway via parentRefs, and defines the actual matching rules and backendRefs — including native weighted traffic splitting, no annotations required.
+
+This maps directly onto real org RBAC boundaries in a way Ingress structurally couldn't: with plain Ingress, anyone with create-permission on Ingress objects in a namespace could effectively influence a shared load balancer's routing. Gateway API lets a platform team own the Gateway and grant app teams only HTTPRoute permissions in their own namespaces — routing intent stays properly scoped.
+
+**ReferenceGrant — an explicit, deliberate cross-namespace security control.** If an HTTPRoute in namespace A wants to reference a backendRef Service in namespace B, or a Gateway wants to reference a TLS Secret in a different namespace, that reference is rejected by default unless a ReferenceGrant object in the target namespace explicitly permits it. No implicit cross-namespace trust — a real security improvement over some of the looser cross-namespace tricks that existed in the Ingress-annotation world. This is also a very real "why does everything look configured correctly but traffic still 404s" gotcha.
+
+**Status conditions are the actual diagnostic surface — and there are two of them that get conflated.** Both HTTPRoute and Gateway report controller-written status back onto the object itself: Accepted (is the route syntactically valid and successfully attached to its parent Gateway) and, separately, ResolvedRefs (do the objects it actually points to — backend Services, TLS Secrets — exist and is access to them permitted). A route can be Accepted: True and still be completely non-functional because ResolvedRefs: False. Checking only the first condition and seeing "True" is a genuinely common false-confidence trap — always read the reason field on ResolvedRefs specifically (BackendNotFound vs RefNotPermitted are different problems with different fixes, both showing up as the same False status).
+
+**cert-manager's ACME flow has a real chicken-and-egg failure mode.** cert-manager watches for TLS configuration (a Certificate resource, or automatically via a Gateway listener's TLS config) and requests a cert from an Issuer/ClusterIssuer — commonly Let's Encrypt via ACME. HTTP-01 challenge validation requires the ACME server to reach a specific path, from the public internet, through the exact same routing infrastructure you're simultaneously trying to configure. If your Gateway/HTTPRoute setup is broken, the HTTP-01 challenge can't complete, so the cert never issues, so TLS never comes up — and the resulting symptom (no HTTPS) looks like a cert problem when the actual root cause is the underlying routing, unresolved. (DNS-01 sidesteps this — it validates via a DNS TXT record instead of inbound HTTP traffic, at the cost of needing DNS provider API credentials configured in cert-manager, but it does support wildcard certs, which HTTP-01 cannot.)
+
+**The 502/503/504 triad each points to a genuinely different layer — collapsing them wastes real triage time:**
+
+- 502 Bad Gateway — the proxy successfully reached the backend, but the connection failed or reset (wrong port configured, nothing listening, pod crashed mid-request).
+- 503 Service Unavailable — the proxy has zero healthy endpoints to send traffic to at all (ties directly back to Module 1/4's readiness-gating: a Service with no Ready backends).
+- 504 Gateway Timeout — the backend was reachable and accepted the connection, but didn't respond within the proxy's configured timeout (a slow app, or resource pressure from Module 6/7 upstream).
+
+Because this is the layer where everything eventually surfaces, the correct triage instinct is always to work backward — check the gateway/ingress controller's own access/error logs first (Envoy Gateway's pod logs, in your setup) to see exactly which of the three it logged, which immediately narrows which earlier module's failure category you're actually chasing.
+
+**The Alternative Landscape**
+
+<img width="863" height="516" alt="image" src="https://github.com/user-attachments/assets/2e217fa5-a81d-423e-98b0-85e81d113b73" />
+
+<img width="872" height="211" alt="image" src="https://github.com/user-attachments/assets/2dd4aa56-7384-45b2-958b-8dc147b072a7" />
+
+You'd choose a Gateway-API-native controller like Envoy Gateway (what you're already running) specifically to avoid ever writing another controller-specific annotation again — the config is portable across any Gateway-API-conformant implementation by design. You'd reach for Istio specifically when the actual requirement extends past ingress into service-mesh territory (mTLS between every internal service, fine-grained east-west traffic policy) — genuine extra operational weight that isn't worth carrying just to expose a few HTTP routes.
+
+**Interview POV & Edge Cases**
+
+Classic prompt: "Users report intermittent 502s on one route — walk me through it." The layered answer: check the gateway/ingress controller's own logs first for the specific upstream error (this tells you 502 vs 503 vs 504 definitively, rather than guessing from the browser's generic error page); check backend Service endpoints for zero-ready-backend (that's actually 503, a different bug entirely); check the actual backend pod's logs and resource state (Module 6/7 territory) if the connection genuinely is failing/timing out.
+
+**Gotchas**:
+
+- An Ingress/HTTPRoute created with no matching IngressClass/GatewayClass installed — silently inert forever, always check kubectl get ingressclass / kubectl get gatewayclass before debugging routing rules themselves.
+- Accepted: True read as "this is working" when ResolvedRefs: False is sitting right next to it — always check both conditions, not just the first one you see.
+- Missing ReferenceGrant for a cross-namespace backendRef or a cross-namespace TLS certificateRef on a Gateway — same underlying mechanism, two different places it bites.
+- The ACME HTTP-01 chicken-and-egg trap — debugging a stuck Certificate in isolation without first confirming the underlying route it depends on was ever actually working.
+- Copy-pasting a controller-specific Ingress annotation from a blog post into a cluster running a different controller (or worse, into an HTTPRoute, where annotations like that have zero effect at all) — a very real mistake when following examples without checking which controller they assumed.
+
+**The 'Better Way' (Evolution)**
+
+Gateway API itself already is the "better way" relative to plain Ingress — but the frontier past it is the GAMMA initiative (Gateway API for Mesh Management and Administration), which extends the same HTTPRoute/GatewayClass model to service-mesh east-west traffic, not just north-south ingress — the goal being one unified routing API instead of Ingress/Gateway for external traffic and a completely separate mesh-specific CRD set for internal traffic. Separately, eBPF-native L7 implementations (Cilium's Envoy-based Gateway API support, or Cilium's own native L7 policy) are collapsing CNI and L7 gateway into a single dataplane, reducing the number of distinct proxy hops a request has to cross.
+
+**Module 8 Lab Pack**
+
+These labs create disposable test objects attached to your existing GatewayClass/Gateway rather than touching your real Envoy Gateway + cert-manager setup — find your actual names first:
+
+```
+kubectl get gatewayclass
+kubectl get gateway -A
+kubectl get clusterissuer
+```
+
+<img width="880" height="485" alt="image" src="https://github.com/user-attachments/assets/3daf79c4-47de-44a8-815e-899b62eca553" />
+
+**Lab 1 — Ingress With No Matching Controller**
+
+**Break**
+
+```
+kubectl get ingressclass   # confirm — likely empty on your Gateway-API-first cluster
+cat <<'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: orphan-ingress
+spec:
+  rules:
+  - host: orphan.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nonexistent-svc
+            port:
+              number: 80
+EOF
+```
+
+**Predict**: Does the API server reject this at creation time, or accept it?
+
+**Diagnose**
+
+```
+bash
+kubectl get ingress orphan-ingress
+kubectl describe ingress orphan-ingress
+```
+
+It's accepted without complaint — the API server never validates that a controller exists to implement it. describe shows no address ever assigned, no meaningful events, ever. Now contrast with a real, working object:
+
+```
+bash
+kubectl get httproute -A -o wide
+kubectl describe httproute <one-of-your-real-routes> -n <its-namespace>
+```
+
+Your real HTTPRoute shows populated status conditions (Accepted: True) — direct proof Envoy Gateway is actually reconciling it, unlike the orphaned Ingress.
+
+**Fix**
+
+```
+kubectl delete ingress orphan-ingress
+```
+
+**Debrief**: Both objects look identically "successfully created" from kubectl apply's perspective — the entire difference is whether anything is watching. kubectl get ingressclass / kubectl get gatewayclass should always be your first check, before you spend any time debugging routing rules that might never even be evaluated.
+
+**Lab 2 — HTTPRoute Backend Not Found**
+
+```
+bash
+kubectl create deployment httproute-test --image=nginx
+kubectl expose deployment httproute-test --port=80
+```
+
+**Break**
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: broken-backend-route
+spec:
+  parentRefs:
+  - name: <your-gateway-name>
+    namespace: <your-gateway-namespace>
+  hostnames: ["broken-backend.test.local"]
+  rules:
+  - backendRefs:
+    - name: totally-wrong-svc-name
+      port: 80
+EOF
+```
+
+**Predict**: Will Accepted be True or False?
+
+**Diagnose**
+
+```
+kubectl describe httproute broken-backend-route
+```
+
+Expect Accepted: True (nothing wrong with the route's own syntax or its attachment to the Gateway) but ResolvedRefs: False, reason BackendNotFound.
+
+**Fix**
+
+```
+kubectl patch httproute broken-backend-route --type=json \
+  -p='[{"op":"replace","path":"/spec/rules/0/backendRefs/0/name","value":"httproute-test"}]'
+kubectl describe httproute broken-backend-route
+```
+
+**Debrief**: This is the two-condition trap made concrete — checking only Accepted and seeing True would have you believing everything's fine while every request 404s. ResolvedRefs is a separate check on a separate concern (does what this route points to actually exist), and you have to read it explicitly.
+
+**Lab 3 — Cross-Namespace Backend, No ReferenceGrant**
+
+**Break**
+
+```
+kubectl create namespace route-ns
+kubectl create namespace backend-ns
+kubectl create deployment cross-ns-backend --image=nginx -n backend-ns
+kubectl expose deployment cross-ns-backend --port=80 -n backend-ns
+
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cross-ns-route
+  namespace: route-ns
+spec:
+  parentRefs:
+  - name: <your-gateway-name>
+    namespace: <your-gateway-namespace>
+  hostnames: ["cross-ns.test.local"]
+  rules:
+  - backendRefs:
+    - name: cross-ns-backend
+      namespace: backend-ns
+      port: 80
+EOF
+```
+
+**Predict**: Same failure reason as Lab 2, or something different — remember, the Service genuinely exists this time.
+
+**Diagnose**
+
+```
+bash
+kubectl describe httproute cross-ns-route -n route-ns
+```
+
+Expect ResolvedRefs: False again, but reason RefNotPermitted — a distinctly different reason string than Lab 2's BackendNotFound, because this time the object exists, it's just not permitted to be referenced.
+
+**Fix**
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-route-ns
+  namespace: backend-ns
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    namespace: route-ns
+  to:
+  - group: ""
+    kind: Service
+EOF
+kubectl describe httproute cross-ns-route -n route-ns
+```
+
+**Debrief**: Two different failure reasons living under the exact same False status condition — you have to read the reason field to know whether you're fixing a typo (Lab 2) or granting a genuine cross-namespace permission (this lab). Clean up:
+
+```
+bash
+kubectl delete namespace route-ns backend-ns
+```
+
+**Lab 4 — cert-manager ACME Chicken-and-Egg**
+
+**Break** — a disposable test Certificate for a domain that can't actually complete validation:
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: broken-acme-test
+spec:
+  secretName: broken-acme-test-tls
+  issuerRef:
+    name: <your-clusterissuer-name>
+    kind: ClusterIssuer
+  dnsNames:
+  - some-domain-you-dont-actually-control.example.com
+EOF
+```
+
+**Predict**: Will this cert ever reach Ready: True? Where will the actual stuck point show up?
+
+**Diagnose**
+
+```
+kubectl describe certificate broken-acme-test
+kubectl get order
+kubectl describe order <order-name>
+kubectl get challenge
+kubectl describe challenge <challenge-name>
+```
+
+Expect the Certificate stuck Ready: False, an Order created, and a Challenge stuck with a validation error — the ACME server genuinely cannot reach that domain to complete HTTP-01 verification.
+
+**Fix**
+
+```
+kubectl delete certificate broken-acme-test
+kubectl delete secret broken-acme-test-tls --ignore-not-found
+```
+
+**Debrief**: This is the chicken-and-egg trap directly — in your real project, HTTP-01 issuance depends entirely on the routing to cert-manager's temporary ACME solver pod already working correctly. If you're ever debugging a stuck Certificate at the same time as a broken route, always fix the routing first and re-attempt cert issuance second — debugging both simultaneously means you can't tell which one is actually causing the symptom you're looking at.
+
+**Lab 5 — 502 vs 503 vs 504, Deliberately Produced**
+
+```
+kubectl create deployment http-demo --image=nginx
+kubectl expose deployment http-demo --port=80
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: http-demo-route
+spec:
+  parentRefs:
+  - name: <your-gateway-name>
+    namespace: <your-gateway-namespace>
+  hostnames: ["http-demo.test.local"]
+  rules:
+  - backendRefs:
+    - name: http-demo
+      port: 80
+EOF
+```
+
+(Point curl at whatever address/hostname your Gateway is actually reachable on — adjust the Host header or DNS as your existing project setup requires.)
+
+**Part A — 503 (zero ready endpoints)**
+
+```
+bash
+kubectl scale deployment http-demo --replicas=0
+curl -H "Host: http-demo.test.local" -sI http://<your-gateway-address>/
+```
+
+**Predict** before running: which of the three codes do you expect with zero backends?
+
+**Part B — 502 (backend exists, wrong port)**
+
+```
+kubectl scale deployment http-demo --replicas=1
+kubectl patch service http-demo --type=json \
+  -p='[{"op":"replace","path":"/spec/ports/0/targetPort","value":9999}]'
+curl -H "Host: http-demo.test.local" -sI http://<your-gateway-address>/
+```
+
+**Predict**: same code as Part A, or different — the Service now has a "ready" endpoint, it's just pointing at nothing listening.
+
+**Part C — 504 (backend slow to respond)**
+
+```
+kubectl patch service http-demo --type=json \
+  -p='[{"op":"replace","path":"/spec/ports/0/targetPort","value":80}]'
+kubectl set image deployment/http-demo nginx=kennethreitz/httpbin
+curl -H "Host: http-demo.test.local" -sI --max-time 10 http://<your-gateway-address>/delay/30
+```
+
+**Predict**: will this time out at the gateway's own configured timeout, or wait the full 30 seconds?
+
+**Diagnose across all three:** check the Envoy Gateway pod's own logs at each stage —
+
+```
+bash
+kubectl logs -n <envoy-gateway-namespace> -l <envoy-gateway-pod-label> --tail=20
+```
+
+The proxy's own logs name the exact upstream failure category each time, which is far more reliable than inferring from the HTTP status code alone.
+
+**Fix**
+
+```
+kubectl delete deployment http-demo
+kubectl delete service http-demo
+kubectl delete httproute http-demo-route
+```
+
+**Debrief**: Three genuinely different root causes, three genuinely different codes, and — critically — none of them tell you which earlier module's failure is actually behind them in a real incident. A 502 could be Module 2's crashed container, a 503 could be Module 1's failing readiness probe, a 504 could be Module 7's resource-starved node. The gateway/ingress layer is where all seven prior modules' failures ultimately collapse into a generic-looking HTTP error — which is exactly why reading the proxy's own access/error logs first, rather than guessing from the status code shown to the user, is the fastest way back to the real cause.
+
+**Lab 6 — Gateway TLS Listener, Cross-Namespace Secret, No ReferenceGrant**
+
+**Break**
+
+```
+kubectl create namespace tls-secret-ns
+openssl req -x509 -newkey rsa:2048 -keyout /tmp/tls.key -out /tmp/tls.crt -days 1 -nodes -subj "/CN=test.local"
+kubectl create secret tls fake-tls --cert=/tmp/tls.crt --key=/tmp/tls.key -n tls-secret-ns
+
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: test-tls-gateway
+spec:
+  gatewayClassName: <your-existing-gatewayclass-name>
+  listeners:
+  - name: https
+    protocol: HTTPS
+    port: 8443
+    tls:
+      certificateRefs:
+      - name: fake-tls
+        namespace: tls-secret-ns
+EOF
+```
+
+**Predict**: Same underlying mechanism as Lab 3, applied to a Gateway instead of an HTTPRoute — will this listener come up?
+
+**Diagnose**
+
+```
+bash
+kubectl describe gateway test-tls-gateway
+```
+
+Expect the listener rejected — Programmed: False or a listener-specific condition citing the cross-namespace cert reference isn't permitted.
+
+**Fix**
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-gateway-cert
+  namespace: tls-secret-ns
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    namespace: default
+  to:
+  - group: ""
+    kind: Secret
+EOF
+kubectl describe gateway test-tls-gateway
+```
+
+**Fix / cleanup**
+
+```
+bash
+kubectl delete gateway test-tls-gateway
+kubectl delete namespace tls-secret-ns
+```
+
+**Debrief**: Same ReferenceGrant mechanism as Lab 3, but this time gating Gateway → Secret instead of HTTPRoute → Service. This exact pattern is directly relevant to your own project the moment TLS certs live in a shared, dedicated namespace separate from app namespaces — a common, sensible real-world layout that requires exactly this grant to actually function.
+
+**Module 9 — Observability-Driven Triage**
+
+Modules 1–8 each gave you a layer-specific diagnostic tree. But a real incident never announces its layer up front — you get "checkout is slow" or "some requests are failing," and the actual skill is figuring out which of those eight modules you're even in, fast, before you touch a single kubectl describe. That's what this module is for: using metrics, logs, traces, and Events together to narrow the search space in minutes instead of guessing your way through eight modules sequentially.
+
+**The 'Why' (The Problem)**
+
+Without a systematic observability layer, engineers facing a vague symptom have exactly two bad options: guess based on what broke last time (fast, biased, often wrong), or manually check every layer in order (thorough, but far too slow under real incident pressure with people watching a dashboard turn red). The three pillars — metrics (is something wrong, and roughly where), logs (what exactly happened, once you've narrowed), traces (which specific hop in a multi-service request chain was the actual problem) — exist specifically to compress that search. Kubernetes' own Events (used constantly throughout Modules 1–8) are actually the fourth, most granular signal — but they're short-lived by default, which is itself a real operational gap this module addresses directly.
+
+**Deep-Dive Mechanics**
+
+**Golden signals first — before anything else.** Google's SRE framework (latency, traffic, errors, saturation) gives you a fast first pass at which module you're probably in:
+
+- Error rate spike → likely app-layer (Module 8) or a crash loop (Module 2).
+- Latency spike, normal error rate → likely resource pressure (Module 7), DNS amplification (Module 4), or slow storage (Module 5).
+- Saturation climbing (CPU/memory/disk approaching limits) → Module 7 territory, and importantly a leading indicator — it predicts an incoming eviction or OOM kill before it happens, rather than explaining one after the fact.
+- Traffic drops to zero → could be DNS (Module 4), could be a scheduling failure preventing pods from ever running at all (Module 3), could be a Gateway/Ingress misconfiguration (Module 8).
+
+**Two complementary lenses, for two different kinds of things. The USE method** (Utilization, Saturation, Errors) is for resources — nodes, disks, CPUs — Module 6/7 territory. The RED method (Rate, Errors, Duration) is for request-driven services — Module 8 territory. Reaching for the wrong one wastes time: USE-style dashboards won't tell you which specific route is erroring; RED-style dashboards won't tell you a node is about to hit DiskPressure.
+
+**kube-state-metrics vs. cAdvisor/node-exporter answer genuinely different questions** — this is the single most senior-differentiating point in this module. kube-state-metrics exposes what Kubernetes thinks the state is — Deployment replica counts, Pod phase, PVC status — essentially kubectl get/describe turned into scrapeable metrics, so you can alert on "available replicas < desired" without polling. cAdvisor (embedded in kubelet, per-pod/container cgroup stats) and node-exporter (raw OS/kernel metrics) tell you what's actually happening underneath. A divergence between the two is itself a diagnostic signal — a Pod reporting Ready: True via kube-state-metrics while node-exporter shows that node's available memory collapsing is a ticking clock, not a healthy state, and a purely kubectl-based investigation (Modules 1–8 in isolation) would show nothing wrong until the eviction has already happened.
+
+**Kubernetes Events are TTL'd — and this is a real, common operational gap.** As covered back in Module 1, Events are namespace-scoped and expire (default ~1 hour, via kube-controller-manager's --event-ttl). Without shipping them somewhere durable, any postmortem written the next day cannot see a single Event from the actual incident window — the exact signal you'd want most for root-cause review is gone by the time anyone sits down to write it up. Tools like kubernetes-event-exporter exist specifically to ship Events into Loki/Elasticsearch/whatever durable store you already run, turning a 1-hour-lifespan signal into a permanently queryable one.
+
+**Distributed tracing solves a problem log correlation genuinely cannot scale to solve**. In a real microservices chain — directly relevant to your e-commerce platform's Gateway → auth → cart → payment → inventory flow — a single slow user request might touch five services. Without a trace ID propagated through every hop, "checkout is slow" can only be investigated by manually eyeballing timestamps across five separate log streams — slow, error-prone, and it gets worse as service count grows. A trace turns that into "the payment service's call to the bank's API accounted for 4.2 of the total 4.5 seconds" — directly actionable, no manual correlation required. OpenTelemetry is the vendor-neutral instrumentation standard for this — it's not a backend itself, it's the propagation/collection layer that can export to whatever backend you choose (Tempo, Jaeger, a commercial APM), which matters because it decouples your app's instrumentation from any single vendor's product.
+
+**Log architecture, and why logs --previous isn't enough at scale.** kubelet redirects every container's stdout/stderr to files under /var/log/pods (via the CRI LogPath). A node-level shipper DaemonSet (Promtail, Fluent Bit) tails those files and ships them to a central store. This matters because Module 1's kubectl logs --previous trick only works if the old container instance still technically exists on the node — once a pod is truly gone (deleted, or the node itself replaced), only centrally-shipped logs survive. If you haven't shipped logs off-node, you've lost them the moment the pod's garbage collected.
+
+**The Alternative Landscape**
+
+<img width="857" height="465" alt="image" src="https://github.com/user-attachments/assets/320757ec-1148-4227-9fc5-2be07bf27043" />
+
+<img width="888" height="262" alt="image" src="https://github.com/user-attachments/assets/d3357b38-10a8-42ac-844c-a37b9d7bb3be" />
+
+**Worth naming explicitly:** your monitoring stack can fall victim to the exact same Module 1–8 failure modes it's meant to help you diagnose — if self-hosted Prometheus runs out of disk (Module 5/7) or gets evicted (Module 7) during the very incident you need it for, you've lost visibility exactly when it matters most. This is a genuine reason larger orgs pay for managed observability specifically for their alerting path, even while self-hosting everything else. You'd reach for eBPF-based tooling specifically for services like your FastAPI microservices where hand-instrumenting every single one with OpenTelemetry SDK calls is real, ongoing engineering cost you might rather avoid for a first pass at visibility.
+
+**Interview POV & Edge Cases**
+
+**Signature senior prompt:** "You're paged for elevated p99 latency on checkout — walk me through your first five minutes, before you touch a single pod." They're testing whether you reach for dashboards first or start kubectl describe-ing things at random. Expected order: check the RED signal for the specific service (which of rate/errors/duration actually moved, and when); check whether it's isolated to that service or cluster-wide (cross-reference against node-level USE metrics); check for a trace pinpointing the actual slow hop; only then drop into the specific module's targeted kubectl commands the metrics/trace pointed you toward.
+
+**Gotchas**:
+
+- Treating "no alert fired" as "nothing is wrong" — alerting coverage gaps are real and common; absence of an alert is not evidence of absence, especially for a genuinely novel failure mode.
+- The "who watches the watchmen" trap — trying to diagnose an observability stack outage using the very stack that's down, directly paralleling Module 6's recursive "kubectl is down because of the thing you're debugging" problem.
+- Trusting kube-state-metrics' Ready: True without cross-checking actual node saturation — the divergence point above, made concrete.
+- Chasing a metrics-visible symptom while the actual root cause is something standard exporters don't capture well by default — Module 4's conntrack exhaustion or Module 7's clock skew are both classic examples that need specific instrumentation to show up in Prometheus at all.
+- Manually eyeballing timestamps across multiple services' logs instead of reaching for a trace ID — doesn't scale past a couple of hops and produces wrong conclusions under time pressure.
+
+**The 'Better Way' (Evolution)**
+
+AI-assisted RCA tools (k8sgpt, Robusta — full circle from Module 1) now ingest metrics, logs, Events, and traces together and propose a starting hypothesis, collapsing "which of the eight modules is this" from minutes to seconds for common, previously-seen patterns. Still a hypothesis generator that needs verification against the diagnostic trees you've actually built through this masterclass — not a replacement for them, especially for genuinely novel failures. And eBPF-based always-on flow/syscall visibility is shifting the whole field from "you had to know what to instrument in advance" toward "it's captured by default, queryable after the fact" — closing exactly the kind of blind spot Module 4 and Module 7 kept surfacing.
+
+**Module 9 Lab Pack**
+
+```
+Lab	Focus	Trains
+1	Install a real metrics stack	The three metric sources, in one Helm chart
+2	kube-state-metrics vs node-exporter divergence	Spotting a ticking-clock state before it becomes an incident
+3	RED signal through your real Envoy Gateway	Closing the loop with Module 8, edge metrics without app instrumentation
+4	Multi-layer chained failure — the capstone	Metrics-first triage across two modules at once
+5	Event retention gap	Why Events alone aren't enough for postmortems
+```
+
+**Lab 1 — Install a Real Metrics Stack**
+
+**Break (nothing to break — building the tool you'll use for the rest of the module)**
+
+```
+bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm install kube-prom-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
+kubectl get pods -n monitoring
+```
+
+**Predict**: How many distinct scrape targets will this one chart set up, and which of the three metric sources from the Deep-Dive will they cover?
+
+**Diagnose**
+
+```
+bash
+kubectl port-forward -n monitoring svc/kube-prom-stack-kube-prome-prometheus 9090:9090 &
+curl -s localhost:9090/api/v1/targets | grep -o '"job":"[^"]*"' | sort -u
+```
+
+Expect targets covering kubelet/cAdvisor, kube-state-metrics, node-exporter, the API server, and the Prometheus/Grafana/Alertmanager components themselves.
+
+```
+bash
+kubectl get secret -n monitoring kube-prom-stack-grafana -o jsonpath='{.data.admin-password}' | base64 -d
+kubectl port-forward -n monitoring svc/kube-prom-stack-grafana 3000:80 &
+```
+
+**Fix**: nothing broken — this is your working baseline for the rest of the module.
+
+**Debrief**: One Helm install gets you exactly the three metric sources from the Deep-Dive, plus query/visualization/alerting on top. This is the actual gap between "I've learned Kubernetes" and "I operate Kubernetes" that most tutorials skip entirely.
+
+**Lab 2 — kube-state-metrics vs node-exporter Divergence**
+
+```
+bash
+kubectl label node worker-1 pressure-test=true
+kubectl describe node worker-1 | grep -A3 Allocatable   # size the hog against real capacity
+```
+
+**Break** — a pod that stays healthy from Kubernetes' point of view while genuinely straining the node:
+
+```
+bash
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: quiet-pressure
+spec:
+  nodeSelector: {pressure-test: "true"}
+  containers:
+  - name: hog
+    image: polinux/stress
+    resources:
+      requests: {memory: "100Mi"}
+    args: ["stress", "--vm", "1", "--vm-bytes", "<~70% of allocatable>", "--vm-hang", "0"]
+EOF
+```
+
+**Predict**: Will kube-state-metrics show anything alarming about this pod at all?
+
+**Diagnose** — via Prometheus (Lab 1's port-forward), PromQL only, no kubectl describe yet:
+
+```
+kube_pod_status_ready{pod="quiet-pressure"}
+```
+
+Expect 1 — perfectly Ready, nothing alarming. Now check the node level:
+
+```
+kube_node_info{node="worker-1"}
+```
+
+(use this to find the matching instance label for node-exporter metrics on that node, then)
+
+```
+node_memory_MemAvailable_bytes{instance="<worker-1's instance label>"}
+```
+
+Watch this collapse toward zero — a real divergence: the Kubernetes-object-level view says fine, the OS-level view says nearly exhausted.
+
+**Fix**
+
+```
+bash
+kubectl delete pod quiet-pressure
+kubectl label node worker-1 pressure-test-
+```
+
+**Debrief**: This is the divergence from the Deep-Dive made visible with real numbers. A purely kubectl-based investigation (everything from Modules 1–8) would show a perfectly healthy Ready: True pod right up until the eviction actually happens — the metrics-level view is what lets you see it coming instead of explaining it after the fact.
+
+**Lab 3 — RED Signal Through Your Real Envoy Gateway**
+
+```
+bash
+kubectl create deployment red-demo --image=kennethreitz/httpbin --replicas=2
+kubectl expose deployment red-demo --port=80
+```
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: red-demo-route
+spec:
+  parentRefs:
+  - name: <your-gateway-name>
+    namespace: <your-gateway-namespace>
+  hostnames: ["red-demo.test.local"]
+  rules:
+  - backendRefs:
+    - name: red-demo
+      port: 80
+EOF
+```
+
+**Break** — generate a mix of success and error traffic through the gateway, not directly at the pod, so Envoy's own metrics capture it:
+
+```
+bash
+kubectl run traffic-gen --image=nicolaka/netshoot --restart=Never -- sleep 3600
+kubectl exec traffic-gen -- sh -c 'for i in $(seq 1 100); do curl -s -H "Host: red-demo.test.local" -o /dev/null http://<gateway-address>/status/200; curl -s -H "Host: red-demo.test.local" -o /dev/null http://<gateway-address>/status/500; done'
+```
+
+**Predict**: Without instrumenting httpbin itself with any Prometheus client library, will you still get real request-rate and error-rate metrics for this route?
+
+**Diagnose** — find Envoy's actual metric names first (naming varies by version, so discover rather than guess):
+
+```
+bash
+kubectl get pods -n <envoy-gateway-namespace>
+kubectl exec -n <envoy-gateway-namespace> <envoy-proxy-pod> -- curl -s localhost:19000/stats/prometheus | grep -i upstream_rq | head -20
+```
+
+Use whatever request-count/response-code-class metrics you find there in Prometheus's query UI to isolate the 5xx count and request duration for this specific route.
+
+**Fix / cleanup**
+
+```
+bash
+kubectl delete deployment red-demo
+kubectl delete service red-demo
+kubectl delete httproute red-demo-route
+kubectl delete pod traffic-gen
+```
+
+**Debrief:** This closes the loop between Module 8 and Module 9 directly — Envoy Gateway, like any real gateway/ingress controller, exposes its own Prometheus metrics for exactly the RED signals, with zero changes to the backend application. This is genuinely how production teams get golden-signal visibility at the edge without hand-instrumenting every single microservice — a real advantage for something like your FastAPI-based platform, where you'd otherwise need per-service OpenTelemetry instrumentation just to get this baseline view.
+
+**Lab 4 — Multi-Layer Chained Failure (Capstone)**
+
+This lab deliberately combines a Module 7 failure with a Module 8 symptom — the whole point is finding the real root cause via metrics before touching any per-pod kubectl describe.
+
+```
+bash
+kubectl label node worker-1 pressure-test=true
+kubectl create deployment chained-app --image=nginx --replicas=4
+kubectl expose deployment chained-app --port=80
+```
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: chained-app-route
+spec:
+  parentRefs:
+  - name: <your-gateway-name>
+    namespace: <your-gateway-namespace>
+  hostnames: ["chained-app.test.local"]
+  rules:
+  - backendRefs:
+    - name: chained-app
+      port: 80
+EOF
+```
+
+**Break**
+
+```
+bash
+kubectl run memory-hog --overrides='{"spec":{"nodeSelector":{"pressure-test":"true"}}}' \
+  --image=polinux/stress -- stress --vm 1 --vm-bytes <~70% of worker-1's allocatable> --vm-hang 0
+```
+
+**Predict:** Before running a single kubectl get pod or describe, what should your first metrics check be, and what do you expect it to show?
+
+**Diagnose — metrics-first, in this order:**
+
+```
+bash
+# 1. Edge signal — is latency/error rate on chained-app elevated at all? (Lab 3's technique)
+# 2. If yes, check whether the Deployment is actually at full capacity:
+kube_deployment_status_replicas_available{deployment="chained-app"}
+kube_deployment_spec_replicas{deployment="chained-app"}
+bash
+# 3. If available < spec, check saturation on the node those missing replicas were on:
+node_memory_MemAvailable_bytes{instance="<worker-1's instance>"}
+```
+
+Only after this metrics-driven narrowing, confirm with targeted kubectl:
+
+```
+bash
+kubectl get pods -l app=chained-app -o wide
+kubectl describe node worker-1 | grep -A5 Conditions
+```
+
+**Fix**
+
+```
+bash
+kubectl delete pod memory-hog
+kubectl label node worker-1 pressure-test-
+kubectl get pods -l app=chained-app -w   # confirm self-healing back to 4/4
+bash
+kubectl delete deployment chained-app
+kubectl delete service chained-app
+kubectl delete httproute chained-app-route
+```
+
+**Debrief**: This is the whole masterclass's thesis in one exercise. The symptom was felt two layers away (Module 8's edge) from where it actually originated (Module 7's node pressure), with Module 1/3-style replica-count and pod-status as the connecting middle layer. kubectl describe pod on one of the surviving, perfectly healthy replicas would have shown nothing wrong at all — it's the metrics-first sequence (edge signal → replica count → node saturation) that actually finds a multi-hop root cause efficiently, instead of randomly describe-ing objects hoping to stumble onto the right one.
+
+**Lab 5 — The Event Retention Gap**
+
+```
+bash
+kubectl create configmap event-test-trigger --from-literal=x=1
+kubectl run event-test --image=nginx:this-tag-does-not-exist-v99 --restart=Never
+kubectl get events --field-selector involvedObject.name=event-test --sort-by=.lastTimestamp
+```
+
+**Predict**: If you came back to check this Event in two hours, would it still be here?
+
+**Diagnose** — check your actual configured retention rather than waiting two hours:
+
+```
+bash
+grep event-ttl /etc/kubernetes/manifests/kube-controller-manager.yaml || echo "no explicit --event-ttl set — default 1h applies"
+```
+
+**Fix:** nothing to break/repair here — the real fix is architectural: ship Events somewhere durable. kubernetes-event-exporter (the resmoio project) is the standard tool for this — it watches the Events API and forwards to Loki/Elasticsearch/whatever backend you already run, rather than letting this signal vanish after an hour. Worth installing alongside the stack from Lab 1 if you want Events to survive past their default TTL — check the project's own repo for current install instructions, since exact chart coordinates shift over time.
+
+**Cleanup**
+
+```
+bash
+kubectl delete pod event-test
+kubectl delete configmap event-test-trigger
+```
+
+**Debrief**: The default 1-hour TTL is genuinely short relative to real incident-review timelines — a postmortem written the next morning cannot see a single Event from the actual incident window unless it was already shipped somewhere durable. This is a gap teams almost always discover after needing an Event that's already gone, never before.
+
+
+
+
+
+
+
+
+
+
+
 
 
 
