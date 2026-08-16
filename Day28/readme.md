@@ -3093,18 +3093,472 @@ kubectl delete configmap event-test-trigger
 
 **Debrief**: The default 1-hour TTL is genuinely short relative to real incident-review timelines — a postmortem written the next morning cannot see a single Event from the actual incident window unless it was already shipped somewhere durable. This is a gap teams almost always discover after needing an Event that's already gone, never before.
 
+**Module 10 — Live Incident Simulations**
 
+Nine modules of diagnostic trees are only worth something if you can pull the right one out under pressure with no hints. This final module drops that scaffolding — no "Module 4 territory" labels, no roadmap telling you which tree to use. Just what you'd actually get: a page.
 
+This module runs differently from the last nine. I'll give you an incident briefing — exactly the amount of information you'd have in the first sixty seconds of getting paged, nothing more. You tell me what you'd check first and why, I respond as the system would (command output, logs, whatever you ask for), and we work it like a real incident until you've found root cause. No peeking at "which module this is" — that's the whole point. We'll run through a few of these.
 
+**📟 Incident 1**
 
+**#incident-4471 — P2 — Checkout error rate elevated**
 
+Paged 14 minutes ago. Dashboard shows checkout HTTP error rate at ~8%, up from a baseline near 0%. Latency (p50/p99) looks normal for the requests that do succeed. No deploys in the last 6 hours. This has been going on for at least 15 minutes and isn't trending up or down — it's holding steady around 8%.
 
+You're on call. What's the first thing you check, and what are you expecting to see?
 
+**Read the clues like evidence, not just facts:**
 
+- Only checkout is affected, everything else is fine. This rules out anything cluster-wide — no shared control-plane issue, no CoreDNS problem, no node-wide resource crisis. Whatever this is, it's local to checkout's own pods or its specific route.
+- Steady 8%, flat for 15 minutes — not climbing, not shrinking. This is the clue people miss. A slow memory leak or building resource pressure would show worsening errors or climbing latency over time. A one-off blip would spike and recover. A perfectly flat, non-trending percentage is the signature of something structural — a fixed portion of capacity is broken, and the rest is fine, and nothing is actively getting worse.
+- Latency is completely normal on the requests that succeed. If the whole service were under shared resource pressure (CPU throttling, GC pauses, a saturated node), you'd expect degraded latency even on the successful requests. Normal latency on successes means the healthy replicas are genuinely, fully healthy.
 
+Put together: this pattern — flat error percentage + normal latency on success + isolated to one service — points at one unhealthy replica out of several, still absorbing a share of traffic, while its siblings are completely fine. Not a service-wide problem. A specific-pod problem hiding inside a healthy-looking Deployment.
 
+**So the next command isn't "check the logs" — it's check replica-level health, not just replica count:**
 
+```
+kubectl get pods -l app=checkout -o wide
+```
 
+Imagine this comes back: 5 replicas, 4 with RESTARTS: 0, one with RESTARTS: 14 — but its current STATUS still says Running. This is the trap: if you'd only glanced at STATUS, everything looks fine. The restart count is what tells you one replica has been dying repeatedly.
+
+```
+kubectl describe pod <that-one-pod> | grep -A3 "Last State"
+```
+
+Say this shows Terminated, Reason: OOMKilled, Exit Code: 137 — straight out of Module 1's exit-code table. That pod is getting memory-killed on a cycle, probably every couple of minutes, likely because its memory limit is sized too tight for some request payloads it occasionally handles.
+
+Here's the part that explains the errors, not just the restarts — a healthy Deployment usually pulls a crashing pod out of Service traffic via readiness (Module 1), so a crash alone shouldn't cause client-facing errors, just reduced capacity. But right after each restart, there's a brief window where kube-proxy's endpoint update and any already-open connections (Module 4's conntrack lesson) can still route a request or two at that pod before it's fully marked unready again. Multiply that small window by "this happens every couple of minutes, 24/7" and you get a small, steady, non-trending error percentage — exactly your 8%, exactly flat, exactly isolated to this one service.
+
+Root cause: one replica's memory limit is undersized for real traffic, causing periodic OOM kills, and the brief post-restart routing gap is what's actually producing client-visible errors. Fix: raise that container's memory limit (or investigate why that specific replica sees larger payloads — sharding, uneven load balancing, etc.), same move as Module 1 Lab 4.
+
+The transferable skill here, more than this specific answer: a flat, non-trending, partial-failure rate is almost always a per-replica problem, not a systemic one — go straight to individual pod health (restart counts, not just status) before you look anywhere else.
+
+**📟 Incident 2**
+
+**#incident-4502 — P3 — Inventory service latency spikes**
+
+- Ops has noticed a pattern over the last few days: inventory service p99 latency spikes to roughly 3-4x its normal baseline every day, consistently around 12:00–13:00 and again 18:00–19:00 — right around lunch and dinner order peaks for the mobile store.
+- 
+- Error rate stays flat at 0% the entire time — nothing is failing, requests just get slow and then recover once the peak passes.
+- Restart count across all inventory replicas: 0, the whole time.
+- Node-level CPU utilization during these windows looks moderate — nowhere near maxed out.
+- No deploys or config changes correlate with when this started.
+
+You're investigating. What's the first thing you'd check, and what are you hoping it tells you?
+
+**Read the clues like evidence:**
+
+- Recurs at exact, predictable traffic peaks (lunch/dinner) — not random. This immediately says "load-correlated," not "flaky infra." Whatever this is, it only manifests under concurrency, not idle.
+- Latency only, zero errors, zero restarts. This rules out OOM (Incident 1's answer), rules out crash loops, rules out anything that kills a process. Requests are getting slow, not failing — the pod is alive and functioning the entire time.
+- Node CPU "moderate" during the spike. This is the clue that trips people up — the natural assumption is "if it were CPU, the node would show maxed-out CPU." It doesn't. That's the tell, not a reason to rule CPU out.
+
+**Here's the trap in that last clue:** node-level aggregate CPU utilization and per-container CPU throttling are two completely different signals. Kubernetes enforces resources.limits.cpu via the kernel's CFS quota mechanism — each container gets a fixed slice of CPU time per 100ms scheduling period. If a container's actual work during a burst exceeds its slice, the kernel pauses it for the rest of that period, even if the node has plenty of idle CPU sitting right next to it on another core. The node-wide dashboard averages across everything and looks fine; the one throttled container experiences real, repeated pauses that add up to exactly the kind of latency spike you're seeing — with zero errors, zero restarts, because throttling delays execution, it never kills anything.
+
+And it explains the timing perfectly: inventory presumably does more actual CPU-bound work per request at lunch/dinner peaks (more concurrent inventory checks), pushing usage against a limits.cpu value that's been sized the same the whole time — nothing changed in config, the peak traffic is what's newly colliding with an existing ceiling.
+
+**The check that actually confirms it** — not raw CPU%, but the throttling-specific cAdvisor metric from Module 9's toolkit:
+
+```
+rate(container_cpu_cfs_throttled_periods_total{pod=~"inventory-.*"}[5m])
+```
+
+against
+
+```
+rate(container_cpu_cfs_throttled_seconds_total{pod=~"inventory-.*"}[5m])
+```
+
+If these spike in lockstep with the 12–13h/18–19h windows, that's your confirmation — and cross-check kubectl get deployment inventory -o jsonpath='{.spec.template.spec.containers[0].resources}' to see how tight that CPU limit actually is relative to what the pods are trying to use during peak.
+
+Fix: raise limits.cpu (or, if the team's comfortable with the trade-off, drop the CPU limit entirely and rely on requests.cpu plus node-level capacity planning — a genuinely debated but common production pattern specifically to avoid this exact throttling behavior).
+
+**Worth naming honestly:** I don't have DB/downstream metrics in this scenario, and CPU throttling isn't the only hypothesis that fits — connection-pool exhaustion against inventory's database under peak concurrency produces an almost identical signature (latency up, zero errors, zero restarts, load-correlated). If the throttling metric above came back flat, that's exactly where I'd look next: pool wait-time metrics on the DB side, or a trace (Module 9) showing whether the time is being spent in inventory's own CPU work or waiting on a downstream call. Keeping two live hypotheses and using one specific metric to eliminate one is normal, correct practice here — not a sign you guessed wrong the first time.
+
+**Simulating Incident 2's Mechanism — CPU Throttling, With Real Numbers**
+
+You already have Prometheus running from Module 9 Lab 1, so let's use it for real instead of just talking about container_cpu_cfs_throttled_periods_total abstractly.
+
+**Break** — a container demanding far more CPU than its limit allows:
+
+```
+cat <<'EOF' | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: throttle-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: throttle-demo}
+  template:
+    metadata:
+      labels: {app: throttle-demo}
+    spec:
+      containers:
+      - name: stress
+        image: polinux/stress
+        resources:
+          requests: {cpu: "100m"}
+          limits: {cpu: "100m"}
+        args: ["stress", "--cpu", "2", "--timeout", "600s"]
+EOF
+```
+
+This container is capped at 0.1 CPU core but is actively trying to burn 2 full cores worth of work — a guaranteed, heavy throttling case.
+
+**Predict**: Will node-level CPU utilization look alarming, or will it look basically fine — same as Incident 2's clue?
+
+**Diagnose**
+
+```
+kubectl port-forward -n monitoring svc/kube-prom-stack-kube-prome-prometheus 9090:9090 &
+```
+
+In Prometheus's query UI (localhost:9090):
+
+```
+rate(container_cpu_cfs_throttled_periods_total{pod=~"throttle-demo.*"}[1m])
+```
+
+Expect this climbing steadily, non-zero — real, ongoing throttling. Now check the node itself — pick worker-1's (or whichever node it landed on) instance label and query:
+
+```
+100 - (avg(rate(node_cpu_seconds_total{mode="idle", instance="<that node's instance>"}[1m])) * 100)
+```
+
+Expect this to look moderate, unremarkable — exactly like the node CPU in Incident 2's briefing, because one container's 100m ceiling has nothing to do with how busy the rest of the node's cores are.
+
+**Fix**
+
+```
+bash
+kubectl patch deployment throttle-demo --type=json \
+  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/cpu","value":"1500m"}]'
+```
+
+Requery the throttled-periods rate — it should fall toward zero within a minute or two as the new limit gives the container enough quota to actually run.
+
+**Cleanup**
+
+```
+kubectl delete deployment throttle-demo
+```
+
+**Debrief**: This is Incident 2's exact mechanism, with real numbers proving it rather than inference. container_cpu_cfs_throttled_periods_total is the one metric that reliably catches this pattern — node-level CPU% will mislead you every single time it's a per-container limit problem rather than genuine node-wide load.
+
+**📟 Incident 3**
+
+**#incident-4519 — P2 — New notifications service unreachable**
+
+- notifications was deployed for the first time about 20 minutes ago as part of a planned rollout. All 3 pods show Running, 3/3 Ready, zero restarts — deployment itself looks completely healthy in every dashboard.
+- 
+- But every single request to notifications fails immediately — not slow, not intermittent, instant failure, 100% of the time, since the moment it deployed.
+- No other service is affected.
+- No relevant Events on the pods themselves — they've been quietly healthy the whole time.
+
+You're investigating. What's the first thing you'd check, and what would you expect it to tell you?
+
+**Read the clues like evidence:**
+
+- Pods are 3/3 Ready, zero restarts, no Events at all — genuinely, boringly healthy. This is a strong signal to stop looking at the pods entirely. Whatever's wrong isn't inside them.
+- Instant failure, not slow. This rules out anything resembling a timeout — no upstream connection attempt is even happening. Compare this to a 504 (backend reachable but slow) or 502 (connection attempted, then failed/reset) — both of those take some time to fail. An instant failure is the signature of the proxy rejecting the request before it ever tries to reach a pod — which is exactly what a 503 is (Module 8: zero healthy endpoints, the proxy doesn't even attempt an upstream call).
+- 100% failure rate, since the very first request, on a brand-new service. Not intermittent, not degrading — it's never worked. That points away from anything that develops over time (leaks, throttling, drift) and toward something that was simply misconfigured from the moment it was created.
+
+Put together: healthy pods + instant + total + brand-new deploy points at the routing layer having nowhere to send traffic, not the pods themselves. The single most common cause of exactly this pattern: a Service selector that doesn't actually match the pod labels — pods run fine, Kubernetes just never wired the Service up to them.
+
+**Diagnose**
+
+```
+bash
+kubectl get endpoints notifications
+```
+
+Expect <none> — this is the confirming moment. The pods are Ready, but the Service has zero endpoints, meaning nothing is actually behind it as far as any proxy is concerned.
+
+```
+bash
+kubectl get service notifications -o jsonpath='{.spec.selector}'
+kubectl get pods --show-labels | grep notifications
+```
+
+This is almost always where you find it — say the Service selector is app: notifications but the Deployment's pod template actually labels pods app: notification-service (or similar near-miss typo). Kubernetes doesn't warn you about this anywhere — a Service with a selector matching zero pods is a completely valid, silently-accepted object.
+
+**Fix**
+
+```
+bash
+kubectl patch service notifications --type=json \
+  -p='[{"op":"replace","path":"/spec/selector/app","value":"notification-service"}]'
+kubectl get endpoints notifications   # confirm pod IPs now populate
+```
+
+**Root cause:** label mismatch between the Service selector and the Deployment's pod template, present since the very first deploy — the pods were never actually behind the Service at all, so every request hit an empty backend set and got an instant 503 at the gateway.
+
+**Worth being honest about the other live hypothesis** I'd have kept open until that first kubectl get endpoints came back: if endpoints had shown pod IPs, the next place to look would've been Module 8's HTTPRoute/Ingress status — Accepted: True but ResolvedRefs: False from a typo'd backendRef name produces an extremely similar instant-100%-failure signature. The endpoints check is exactly the one command that cleanly splits those two hypotheses apart, which is why it's the right first move here rather than jumping straight to describe httproute.
+
+**Simulating Incident 3 — Selector Mismatch, Zero Endpoints, Instant 503**
+
+**Break**
+
+```
+bash
+kubectl create deployment notif-demo --image=nginx --replicas=3
+kubectl expose deployment notif-demo --port=80 --name=notif-svc
+kubectl get pods -l app=notif-demo   # confirm 3/3 Running, Ready — genuinely healthy
+```
+
+Now introduce the exact mismatch from the incident:
+
+```
+bash
+kubectl patch service notif-svc --type=json \
+  -p='[{"op":"replace","path":"/spec/selector/app","value":"wrong-label"}]'
+```
+
+**Predict**: Will the pods' own status change at all? What will kubectl get endpoints show?
+
+**Diagnose**
+
+```
+bash
+kubectl get pods -l app=notif-demo   # still 3/3 Ready — untouched, exactly like the incident
+kubectl get endpoints notif-svc      # <none>
+kubectl get service notif-svc -o jsonpath='{.spec.selector}{"\n"}'
+kubectl get pods --show-labels | grep notif-demo
+```
+
+Line the two up side by side — the Service is asking for app=wrong-label, the pods are labeled app=notif-demo. Zero overlap, zero endpoints, and nothing about it is visible from the pods' own perspective at all.
+
+Route it through your real Gateway to see the actual instant failure a client would hit, tying back to Module 8:
+
+```
+bash
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: notif-demo-route
+spec:
+  parentRefs:
+  - name: <your-gateway-name>
+    namespace: <your-gateway-namespace>
+  hostnames: ["notif-demo.test.local"]
+  rules:
+  - backendRefs:
+    - name: notif-svc
+      port: 80
+EOF
+
+curl -sI -H "Host: notif-demo.test.local" --max-time 3 http://<gateway-address>/
+```
+
+Expect an immediate 503 — no delay, because Envoy never even attempts an upstream connection when it has zero endpoints to choose from. Compare that instant response time against Module 8 Lab 5's 504 timeout — the speed of the failure alone tells you which one you're looking at, before you read a single status code.
+
+**Fix**
+
+```
+bash
+kubectl patch service notif-svc --type=json \
+  -p='[{"op":"replace","path":"/spec/selector/app","value":"notif-demo"}]'
+kubectl get endpoints notif-svc   # pod IPs populate
+curl -sI -H "Host: notif-demo.test.local" http://<gateway-address>/   # 200 now
+```
+
+**Cleanup**
+
+```
+bash
+kubectl delete deployment notif-demo
+kubectl delete service notif-svc
+kubectl delete httproute notif-demo-route
+```
+
+**Debrief**: You just watched the fastest, most silent failure mode in this whole masterclass — no restart, no Event, no unhealthy condition anywhere, just one string not matching another. kubectl get endpoints on any suspiciously "healthy but unreachable" service should be close to a reflex at this point.
+
+**📟 Incident 4**
+
+**#incident-4538 — P1 — Order processing completely stalled**
+
+- orders Deployment shows 5/5 Ready, all healthy, zero restarts. kubectl get pods looks completely normal.
+- But orders placed in the last ~25 minutes have not progressed past "pending" — nothing downstream is happening at all.
+- Metrics dashboard: request rate into orders is normal. Error rate: 0%. Latency: normal.
+- Someone mentions a teammate ran kubectl scale deployment orders-worker --replicas=0 about 30 minutes ago "to test something" and then got pulled into another meeting.
+
+What's the first thing you'd check, and — given that last detail — what's your working theory already?
+
+**What you said, evaluated:**
+
+- "Check if pods are running" — you checked orders' pods specifically, and they're already reported 5/5 Ready. That's a dead end on its own — nothing there points anywhere.
+- "Scale back to 5" — correct fix, correct target. But notice why you knew to target orders-worker: the ticket told you outright. In a real page, that detail often doesn't show up as a tidy confession — you'd have to find it yourself.
+
+**So here's the piece worth building as a reflex**: the ticket shows you a dashboard for orders — 5/5 Ready, 0% errors, normal latency — and it's telling the truth. orders genuinely is healthy. The mistake would be assuming that dashboard represents the whole system. "Orders stall at pending, nothing progresses downstream" is the signature of a missing consumer, not a broken API — something has to be pulling items off a queue/pending-state and moving them forward, and that something is architecturally a different deployment than the one accepting the request. The diagnostic move, without being told the answer, is:
+
+```
+bash
+kubectl get deployments
+```
+
+— not just orders, all of them — specifically looking for anything sitting at 0/0 that shouldn't be. That's how you'd spot orders-worker cold, the same way you'd spot Incident 3's selector mismatch: by checking the thing nobody mentioned yet, not just the thing the dashboard already flagged as unhealthy (here, nothing was flagged at all).
+
+**Confirm before you fix:**
+
+```
+bash
+kubectl get deployment orders-worker
+```
+
+Expect 0/0 — confirms the theory before you act on it, rather than scaling blind based on secondhand info from a teammate's Slack message.
+
+**Fix**
+
+```
+bash
+kubectl scale deployment orders-worker --replicas=5
+kubectl get pods -l app=orders-worker -w
+```
+
+Watch the "pending" backlog actually start draining once workers come back — that drain is your confirmation, not just the replica count going green.
+
+The transferable lesson: a healthy dashboard for the component that's named in the complaint doesn't mean the system is healthy — it means that specific component is healthy. "Nothing progresses" with zero errors anywhere is almost always a missing worker/consumer, not a broken producer, and kubectl get deployments (the whole list, not the one you were pointed at) is the cheap first move that finds it.
+
+📟 Incident 5 — P1
+
+Rollout stuck, old and new pods coexisting for 40+ minutes
+
+payments Deployment updated 40 minutes ago (image bump only, no other changes). kubectl rollout status never completes. kubectl get pods shows 3 old-version pods still Running and 3 new-version pods stuck 0/1 Running — not crashing, not restarting, just never becoming Ready. Old pods are still serving traffic fine. No alerts have fired because nothing is actually down.
+
+📟 Incident 6 — P2
+
+One specific customer's requests always fail; everyone else is fine
+
+Support escalates: one enterprise customer reports 100% failure on every API call for the last hour. Every other customer, same endpoints, same service, works perfectly. The customer's requests are confirmed reaching your edge (visible in gateway access logs) but always come back with an error.
+
+📟 Incident 7 — P1
+
+Full outage at 3:14 AM, nobody touched anything
+
+Total outage, ~6 minutes, self-resolved before anyone finished loading a dashboard. Deploy history: nothing in the last 5 days. No kubectl commands run by anyone during that window per audit log. It's the second time this exact thing has happened — both times roughly 90 days apart.
+
+📟 Incident 8 — P2
+
+Autoscaler added nodes, pods are still Pending
+
+Traffic spike triggered the autoscaler correctly — 2 new nodes joined the cluster 4 minutes ago, both show Ready. But 6 pods from the affected Deployment are still Pending, and it's been long enough that this shouldn't still be scheduling delay.
+
+📟 Incident 9 — P3
+
+A nightly Job that took 2 minutes now takes 45, no changes in 2 weeks
+
+nightly-reconciliation CronJob has run daily for months, historically ~2 minutes. Over the last ~10 days it's crept up — 8 min, then 15, then last night 45 minutes. No code deploys, no config changes, no notable growth in the input dataset per the team that owns it.
+
+📟 Incident 10 — P2
+
+One pod cycles: Scheduled → Running → Evicted, repeatedly, on both workers
+
+A specific pod in a batch-processing Deployment gets scheduled, runs for 2-3 minutes, gets evicted, immediately reschedules onto the other worker, runs 2-3 minutes, evicted again — bouncing back and forth for the last hour. Every other pod on both nodes is completely stable throughout.
+
+📟 Incident 11 — P1
+
+One namespace can't reach anything outside the cluster; everything internal is fine
+
+Pods in the data-pipeline namespace can resolve DNS fine and reach every other in-cluster Service without issue. Every attempt to reach anything external (an S3 endpoint, an external API) times out. Every other namespace on the same nodes has normal external connectivity right now.
+
+📟 Incident 12 — P3
+
+Prometheus itself stops scraping the moment you actually need it
+
+During the biggest incident of the quarter, someone opens Grafana to check checkout's dashboards — every panel says "No data" for the last 20 minutes. The incident being investigated is unrelated to Prometheus itself.
+
+Rapid round — shorter, for pattern-recognition reps:
+
+13. A Job's pod succeeds and exits 0, but the Job object itself never shows Complete.
+14. kubectl exec into a pod works fine; the app inside reports it can't connect to its own sidecar on localhost.
+15. A Deployment scaled to 10 replicas; only 7 ever come up, no errors anywhere, ResourceQuota isn't mentioned by anyone on the team.
+16. After a routine node AMI upgrade, every pod using a specific PVC fails to mount — Multi-Attach error, even though nothing was ever scaled up.
+17. A cron-triggered batch job works fine 29 days a month; fails every time it lands on the last day of a month.
+18. kubectl get pods is slow — genuinely slow, several seconds — but only for one specific namespace.
+
+SOLUTIONS:
+
+5 — Rollout stuck, old pods still serving
+Cause: New pods are failing their readiness probe — likely the new image changed startup time, port, or health-check path. Deployment's rollout is readiness-gated: it won't scale down old pods until new ones pass Ready, so nothing pages because old pods keep serving the whole time.
+Confirm: kubectl describe pod <new-pod> → look for repeated Unhealthy readiness events; kubectl logs <new-pod> to see if the app even started.
+Fix: Correct the probe config to match the new image's real health endpoint/port (or fix the app if it regressed). kubectl rollout undo as immediate mitigation while you sort out root cause.
+Lesson: A stuck rollout with old pods still healthy is a readiness problem on the new pods — check probe config diffs alongside image diffs.
+
+6 — One customer fails 100%, everyone else fine
+Cause: Usually not customer-specific logic — it's this customer's requests consistently landing on one unhealthy backend pod via session affinity/consistent hashing, or their unique request shape (large payload, unusual header/auth format) tripping a size or validation limit nobody else hits.
+Confirm: Check gateway/Envoy access logs for the actual upstream response code and which pod served their requests specifically; check for session affinity config on the Service/HTTPRoute.
+Fix: Depends on branch — fix/replace the specific bad backend, or adjust the limit/webhook rule tripped by their request shape.
+Lesson: "One customer always fails" often means "this customer always lands on the one broken pod," not a customer-specific bug — confirm where it fails before assuming app logic.
+
+7 — 3:14 AM outage, no human action, recurs ~90 days apart
+Cause: The ~90-day period is the whole clue — that's Let's Encrypt's certificate lifetime. cert-manager's automatic renewal is rotating a cert, and the proxy isn't hot-reloading the new Secret cleanly, causing a brief gap.
+Confirm: kubectl get certificate -A — check renewal timestamps against outage times; check cert-manager and Envoy Gateway logs/events for activity at 3:14 AM.
+Fix: Ensure the proxy watches and reloads the TLS Secret without requiring a restart, or adjust cert-manager's renewal timing/buffer.
+Lesson: "Nobody touched anything" + fixed periodicity = an automated system, almost always. Check everything on a schedule (cert renewal, token rotation, cron) before treating it as unexplainable.
+
+8 — New nodes Ready, pods still Pending
+Cause: kubectl get nodes showing Ready only reflects kubelet's basic health check — some CNIs (Cilium notably) apply their own taint (e.g. node.cilium.io/agent-not-ready:NoSchedule) until their own networking agent DaemonSet is actually functional on that node, deliberately blocking scheduling until real pod networking works.
+Confirm: kubectl describe node <new-node> → check Taints; kubectl describe pod <pending-pod> → FailedScheduling citing an untolerated taint.
+Fix: Wait for the CNI agent pod to become Ready (taint self-removes); if stuck, diagnose why the CNI agent itself won't start on the new node (Module 2/4).
+Lesson: "Node Ready" ≠ "node ready for pods" — some CNIs taint new nodes on purpose to prevent exactly this race.
+
+9 — Nightly job creeps from 2 min to 45 min, no code/data changes
+Cause: EBS gp2 burst-credit exhaustion — burstable IOPS volumes deplete a credit balance under sustained I/O; once exhausted, performance drops to a much lower baseline, invisible anywhere in Kubernetes.
+Confirm: CloudWatch BurstBalance metric on the volume — trending toward 0% matching the slowdown.
+Fix: Move to gp3 (flat provisioned baseline, no credit system) or provision more IOPS.
+Lesson: Cloud-provider burstable-performance resources degrade silently with zero Kubernetes-visible signal — "no code changes" doesn't rule out infrastructure decay.
+
+10 — One pod bounces Scheduled→Evicted between both nodes, everything else stable
+Cause: This one pod's resource request is under-sized relative to its real usage (Burstable QoS) — wherever it lands, it eventually ranks worst in eviction ordering under normal fluctuation, gets evicted, reschedules on the other node, repeats.
+Confirm: kubectl top pod vs its requests; check Evicted reason on prior instances.
+Fix: Right-size the request to match real usage.
+Lesson: One pod bouncing while everything else is stable is almost always that pod's own request-vs-usage mismatch, not cluster-wide pressure.
+
+11 — One namespace has no external egress, internal fine, other namespaces on same nodes fine
+Cause: A NetworkPolicy scoped to that namespace with a default-deny egress rule that never allowlisted external CIDRs — since other namespaces on the same nodes are unaffected, this rules out node/CNI/security-group causes immediately.
+Confirm: kubectl get networkpolicy -n data-pipeline — check egress rules for missing external CIDR allowance.
+Fix: Add an explicit egress rule for required external ranges/ports.
+Lesson: Same default-deny trap as Module 4, but namespace-scoped — "other namespaces fine, same nodes" should point you straight at NetworkPolicy, not infrastructure.
+
+12 — Prometheus goes dark during the actual incident
+Cause: The incident itself (mass pod restarts, label churn) is spiking Prometheus's own time-series cardinality, pushing it over its own memory limit right when it's needed most — the "who watches the watchmen" problem.
+Confirm: Check if the Prometheus pod itself restarted/OOMKilled around that time; its own self-scraped prometheus_tsdb_head_series metric for a spike.
+Fix: Raise Prometheus's resource limits with real headroom, reduce label cardinality sources, and seriously consider isolating your monitoring stack's blast radius from what it watches.
+Lesson: Your observability stack is a workload subject to every failure mode in Modules 1–7 — including failing exactly when incident-driven churn stresses it hardest.
+
+13 — Job's pod exits 0, Job never shows Complete
+Cause: .spec.completions is set >1 and not all required successful completions have happened yet.
+Confirm: kubectl get job -o yaml — compare completions vs status.succeeded.
+Lesson: One successful pod ≠ Job done if it needs N successes — check the completions count first.
+
+14 — App can't reach its own sidecar on localhost
+Cause: Regular containers in a pod don't start in guaranteed order — the app started before the sidecar was actually listening.
+Confirm: Check the sidecar's own readiness/logs at that moment.
+Lesson: "localhost" doesn't mean "already listening" — use native sidecars (restartPolicy: Always init containers) or add retry logic.
+
+15 — Deployment scaled to 10, only 7 come up, no errors "anywhere"
+Cause: Almost always a ResourceQuota nobody remembered exists — or the missing 3 are sitting Pending with FailedScheduling events nobody actually checked.
+Confirm: kubectl get resourcequota -n <ns>; check the missing pods' own status directly.
+Lesson: "No errors anywhere" often just means nobody checked the individual pod events yet.
+
+16 — After AMI upgrade, PVC pods hit Multi-Attach without scaling
+Cause: Nodes were replaced without a proper drain, leaving a stale VolumeAttachment pointing at a now-gone node — Module 5 Lab 4's scenario via routine ops.
+Confirm: kubectl get volumeattachment for one referencing a node that no longer exists.
+Lesson: Node replacement must cordon+drain before termination, or you inherit the stuck-VolumeAttachment problem as routine fallout.
+
+17 — Cron job fails only on the last day of the month
+Cause: A date-math bug in the job's own code (month-boundary/day-31 edge case) — genuinely an application bug, not infrastructure.
+Confirm: Check the job's logs from a failing run for a date-parsing error.
+Lesson: Not everything is a Kubernetes problem — calendar-aligned failures are a classic app-code signature; don't reach for infra diagnostics first.
+
+18 — kubectl get pods slow, only in one namespace
+Cause: That namespace has accumulated a huge number of uncleaned objects (completed Jobs/Pods with no TTL), making list operations against it genuinely slower.
+Confirm: kubectl get pods -n <ns> --no-headers | wc -l (and Jobs/Events) vs a normal namespace.
+Lesson: Object hygiene matters — ttlSecondsAfterFinished on Jobs exists specifically to prevent this.
 
 
 
