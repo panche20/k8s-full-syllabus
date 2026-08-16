@@ -1,8 +1,10 @@
-<img width="916" height="550" alt="image" src="https://github.com/user-attachments/assets/cf2eacc0-d585-465e-84d6-41075f595782" /># Kubernetes Troubleshooting MasterClass
+# Kubernetes Troubleshooting MasterClass
 
 ## The Roadmap
 
 <img width="912" height="538" alt="image" src="https://github.com/user-attachments/assets/8b86eb22-1332-4194-96b8-90bfedd61cda" />
+
+<img width="916" height="550" alt="image" src="https://github.com/user-attachments/assets/cf2eacc0-d585-465e-84d6-41075f595782" />
 
 *Modules 6–7 will lean on your chaos labs directly. Let's start.*
 
