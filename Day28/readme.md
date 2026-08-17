@@ -3425,49 +3425,49 @@ Watch the "pending" backlog actually start draining once workers come back — t
 
 The transferable lesson: a healthy dashboard for the component that's named in the complaint doesn't mean the system is healthy — it means that specific component is healthy. "Nothing progresses" with zero errors anywhere is almost always a missing worker/consumer, not a broken producer, and kubectl get deployments (the whole list, not the one you were pointed at) is the cheap first move that finds it.
 
-📟 Incident 5 — P1
+**📟 Incident 5 — P1**
 
 Rollout stuck, old and new pods coexisting for 40+ minutes
 
 payments Deployment updated 40 minutes ago (image bump only, no other changes). kubectl rollout status never completes. kubectl get pods shows 3 old-version pods still Running and 3 new-version pods stuck 0/1 Running — not crashing, not restarting, just never becoming Ready. Old pods are still serving traffic fine. No alerts have fired because nothing is actually down.
 
-📟 Incident 6 — P2
+**📟 Incident 6 — P2**
 
 One specific customer's requests always fail; everyone else is fine
 
 Support escalates: one enterprise customer reports 100% failure on every API call for the last hour. Every other customer, same endpoints, same service, works perfectly. The customer's requests are confirmed reaching your edge (visible in gateway access logs) but always come back with an error.
 
-📟 Incident 7 — P1
+**📟 Incident 7 — P1**
 
 Full outage at 3:14 AM, nobody touched anything
 
 Total outage, ~6 minutes, self-resolved before anyone finished loading a dashboard. Deploy history: nothing in the last 5 days. No kubectl commands run by anyone during that window per audit log. It's the second time this exact thing has happened — both times roughly 90 days apart.
 
-📟 Incident 8 — P2
+**📟 Incident 8 — P2**
 
 Autoscaler added nodes, pods are still Pending
 
 Traffic spike triggered the autoscaler correctly — 2 new nodes joined the cluster 4 minutes ago, both show Ready. But 6 pods from the affected Deployment are still Pending, and it's been long enough that this shouldn't still be scheduling delay.
 
-📟 Incident 9 — P3
+**📟 Incident 9 — P3**
 
 A nightly Job that took 2 minutes now takes 45, no changes in 2 weeks
 
 nightly-reconciliation CronJob has run daily for months, historically ~2 minutes. Over the last ~10 days it's crept up — 8 min, then 15, then last night 45 minutes. No code deploys, no config changes, no notable growth in the input dataset per the team that owns it.
 
-📟 Incident 10 — P2
+**📟 Incident 10 — P2**
 
 One pod cycles: Scheduled → Running → Evicted, repeatedly, on both workers
 
 A specific pod in a batch-processing Deployment gets scheduled, runs for 2-3 minutes, gets evicted, immediately reschedules onto the other worker, runs 2-3 minutes, evicted again — bouncing back and forth for the last hour. Every other pod on both nodes is completely stable throughout.
 
-📟 Incident 11 — P1
+**📟 Incident 11 — P1**
 
 One namespace can't reach anything outside the cluster; everything internal is fine
 
 Pods in the data-pipeline namespace can resolve DNS fine and reach every other in-cluster Service without issue. Every attempt to reach anything external (an S3 endpoint, an external API) times out. Every other namespace on the same nodes has normal external connectivity right now.
 
-📟 Incident 12 — P3
+**📟 Incident 12 — P3**
 
 Prometheus itself stops scraping the moment you actually need it
 
@@ -3482,92 +3482,98 @@ Rapid round — shorter, for pattern-recognition reps:
 17. A cron-triggered batch job works fine 29 days a month; fails every time it lands on the last day of a month.
 18. kubectl get pods is slow — genuinely slow, several seconds — but only for one specific namespace.
 
-SOLUTIONS:
+**SOLUTIONS:**
 
-5 — Rollout stuck, old pods still serving
-Cause: New pods are failing their readiness probe — likely the new image changed startup time, port, or health-check path. Deployment's rollout is readiness-gated: it won't scale down old pods until new ones pass Ready, so nothing pages because old pods keep serving the whole time.
+**5 — Rollout stuck, old pods still serving**
+
+**Cause:** New pods are failing their readiness probe — likely the new image changed startup time, port, or health-check path. Deployment's rollout is readiness-gated: it won't scale down old pods until new ones pass Ready, so nothing pages because old pods keep serving the whole time.
 Confirm: kubectl describe pod <new-pod> → look for repeated Unhealthy readiness events; kubectl logs <new-pod> to see if the app even started.
-Fix: Correct the probe config to match the new image's real health endpoint/port (or fix the app if it regressed). kubectl rollout undo as immediate mitigation while you sort out root cause.
-Lesson: A stuck rollout with old pods still healthy is a readiness problem on the new pods — check probe config diffs alongside image diffs.
+**Fix**: Correct the probe config to match the new image's real health endpoint/port (or fix the app if it regressed). kubectl rollout undo as immediate mitigation while you sort out root cause.
+**Lesson**: A stuck rollout with old pods still healthy is a readiness problem on the new pods — check probe config diffs alongside image diffs.
 
-6 — One customer fails 100%, everyone else fine
-Cause: Usually not customer-specific logic — it's this customer's requests consistently landing on one unhealthy backend pod via session affinity/consistent hashing, or their unique request shape (large payload, unusual header/auth format) tripping a size or validation limit nobody else hits.
-Confirm: Check gateway/Envoy access logs for the actual upstream response code and which pod served their requests specifically; check for session affinity config on the Service/HTTPRoute.
-Fix: Depends on branch — fix/replace the specific bad backend, or adjust the limit/webhook rule tripped by their request shape.
-Lesson: "One customer always fails" often means "this customer always lands on the one broken pod," not a customer-specific bug — confirm where it fails before assuming app logic.
+**6 — One customer fails 100%, everyone else fine**
 
-7 — 3:14 AM outage, no human action, recurs ~90 days apart
-Cause: The ~90-day period is the whole clue — that's Let's Encrypt's certificate lifetime. cert-manager's automatic renewal is rotating a cert, and the proxy isn't hot-reloading the new Secret cleanly, causing a brief gap.
-Confirm: kubectl get certificate -A — check renewal timestamps against outage times; check cert-manager and Envoy Gateway logs/events for activity at 3:14 AM.
-Fix: Ensure the proxy watches and reloads the TLS Secret without requiring a restart, or adjust cert-manager's renewal timing/buffer.
-Lesson: "Nobody touched anything" + fixed periodicity = an automated system, almost always. Check everything on a schedule (cert renewal, token rotation, cron) before treating it as unexplainable.
+**Cause:** Usually not customer-specific logic — it's this customer's requests consistently landing on one unhealthy backend pod via session affinity/consistent hashing, or their unique request shape (large payload, unusual header/auth format) tripping a size or validation limit nobody else hits.
+**Confirm:** Check gateway/Envoy access logs for the actual upstream response code and which pod served their requests specifically; check for session affinity config on the Service/HTTPRoute.
+**Fix:** Depends on branch — fix/replace the specific bad backend, or adjust the limit/webhook rule tripped by their request shape.
+**Lesson:** "One customer always fails" often means "this customer always lands on the one broken pod," not a customer-specific bug — confirm where it fails before assuming app logic.
 
-8 — New nodes Ready, pods still Pending
-Cause: kubectl get nodes showing Ready only reflects kubelet's basic health check — some CNIs (Cilium notably) apply their own taint (e.g. node.cilium.io/agent-not-ready:NoSchedule) until their own networking agent DaemonSet is actually functional on that node, deliberately blocking scheduling until real pod networking works.
-Confirm: kubectl describe node <new-node> → check Taints; kubectl describe pod <pending-pod> → FailedScheduling citing an untolerated taint.
-Fix: Wait for the CNI agent pod to become Ready (taint self-removes); if stuck, diagnose why the CNI agent itself won't start on the new node (Module 2/4).
-Lesson: "Node Ready" ≠ "node ready for pods" — some CNIs taint new nodes on purpose to prevent exactly this race.
+**7 — 3:14 AM outage, no human action, recurs ~90 days apart**
 
-9 — Nightly job creeps from 2 min to 45 min, no code/data changes
-Cause: EBS gp2 burst-credit exhaustion — burstable IOPS volumes deplete a credit balance under sustained I/O; once exhausted, performance drops to a much lower baseline, invisible anywhere in Kubernetes.
-Confirm: CloudWatch BurstBalance metric on the volume — trending toward 0% matching the slowdown.
-Fix: Move to gp3 (flat provisioned baseline, no credit system) or provision more IOPS.
-Lesson: Cloud-provider burstable-performance resources degrade silently with zero Kubernetes-visible signal — "no code changes" doesn't rule out infrastructure decay.
+**Cause:** The ~90-day period is the whole clue — that's Let's Encrypt's certificate lifetime. cert-manager's automatic renewal is rotating a cert, and the proxy isn't hot-reloading the new Secret cleanly, causing a brief gap.
+**Confirm:** kubectl get certificate -A — check renewal timestamps against outage times; check cert-manager and Envoy Gateway logs/events for activity at 3:14 AM.
+**Fix:** Ensure the proxy watches and reloads the TLS Secret without requiring a restart, or adjust cert-manager's renewal timing/buffer.
+**Lesson:** "Nobody touched anything" + fixed periodicity = an automated system, almost always. Check everything on a schedule (cert renewal, token rotation, cron) before treating it as unexplainable.
 
-10 — One pod bounces Scheduled→Evicted between both nodes, everything else stable
-Cause: This one pod's resource request is under-sized relative to its real usage (Burstable QoS) — wherever it lands, it eventually ranks worst in eviction ordering under normal fluctuation, gets evicted, reschedules on the other node, repeats.
-Confirm: kubectl top pod vs its requests; check Evicted reason on prior instances.
-Fix: Right-size the request to match real usage.
-Lesson: One pod bouncing while everything else is stable is almost always that pod's own request-vs-usage mismatch, not cluster-wide pressure.
+**8 — New nodes Ready, pods still Pending**
 
-11 — One namespace has no external egress, internal fine, other namespaces on same nodes fine
-Cause: A NetworkPolicy scoped to that namespace with a default-deny egress rule that never allowlisted external CIDRs — since other namespaces on the same nodes are unaffected, this rules out node/CNI/security-group causes immediately.
-Confirm: kubectl get networkpolicy -n data-pipeline — check egress rules for missing external CIDR allowance.
-Fix: Add an explicit egress rule for required external ranges/ports.
-Lesson: Same default-deny trap as Module 4, but namespace-scoped — "other namespaces fine, same nodes" should point you straight at NetworkPolicy, not infrastructure.
+**Cause:** kubectl get nodes showing Ready only reflects kubelet's basic health check — some CNIs (Cilium notably) apply their own taint (e.g. node.cilium.io/agent-not-ready:NoSchedule) until their own networking agent DaemonSet is actually functional on that node, deliberately blocking scheduling until real pod networking works.
+**Confirm:** kubectl describe node <new-node> → check Taints; kubectl describe pod <pending-pod> → FailedScheduling citing an untolerated taint.
+**Fix:** Wait for the CNI agent pod to become Ready (taint self-removes); if stuck, diagnose why the CNI agent itself won't start on the new node (Module 2/4).
+**Lesson:** "Node Ready" ≠ "node ready for pods" — some CNIs taint new nodes on purpose to prevent exactly this race.
 
-12 — Prometheus goes dark during the actual incident
-Cause: The incident itself (mass pod restarts, label churn) is spiking Prometheus's own time-series cardinality, pushing it over its own memory limit right when it's needed most — the "who watches the watchmen" problem.
-Confirm: Check if the Prometheus pod itself restarted/OOMKilled around that time; its own self-scraped prometheus_tsdb_head_series metric for a spike.
-Fix: Raise Prometheus's resource limits with real headroom, reduce label cardinality sources, and seriously consider isolating your monitoring stack's blast radius from what it watches.
-Lesson: Your observability stack is a workload subject to every failure mode in Modules 1–7 — including failing exactly when incident-driven churn stresses it hardest.
+**9 — Nightly job creeps from 2 min to 45 min, no code/data changes**
 
-13 — Job's pod exits 0, Job never shows Complete
-Cause: .spec.completions is set >1 and not all required successful completions have happened yet.
-Confirm: kubectl get job -o yaml — compare completions vs status.succeeded.
-Lesson: One successful pod ≠ Job done if it needs N successes — check the completions count first.
+**Cause:** EBS gp2 burst-credit exhaustion — burstable IOPS volumes deplete a credit balance under sustained I/O; once exhausted, performance drops to a much lower baseline, invisible anywhere in Kubernetes.
+**Confirm:** CloudWatch BurstBalance metric on the volume — trending toward 0% matching the slowdown.
+**Fix:** Move to gp3 (flat provisioned baseline, no credit system) or provision more IOPS.
+**Lesson:** Cloud-provider burstable-performance resources degrade silently with zero Kubernetes-visible signal — "no code changes" doesn't rule out infrastructure decay.
 
-14 — App can't reach its own sidecar on localhost
-Cause: Regular containers in a pod don't start in guaranteed order — the app started before the sidecar was actually listening.
-Confirm: Check the sidecar's own readiness/logs at that moment.
-Lesson: "localhost" doesn't mean "already listening" — use native sidecars (restartPolicy: Always init containers) or add retry logic.
+**10 — One pod bounces Scheduled→Evicted between both nodes, everything else stable**
 
-15 — Deployment scaled to 10, only 7 come up, no errors "anywhere"
-Cause: Almost always a ResourceQuota nobody remembered exists — or the missing 3 are sitting Pending with FailedScheduling events nobody actually checked.
-Confirm: kubectl get resourcequota -n <ns>; check the missing pods' own status directly.
-Lesson: "No errors anywhere" often just means nobody checked the individual pod events yet.
+**Cause:** This one pod's resource request is under-sized relative to its real usage (Burstable QoS) — wherever it lands, it eventually ranks worst in eviction ordering under normal fluctuation, gets evicted, reschedules on the other node, repeats.
+**Confirm:** kubectl top pod vs its requests; check Evicted reason on prior instances.
+**Fix:** Right-size the request to match real usage.
+**Lesson:** One pod bouncing while everything else is stable is almost always that pod's own request-vs-usage mismatch, not cluster-wide pressure.
 
-16 — After AMI upgrade, PVC pods hit Multi-Attach without scaling
-Cause: Nodes were replaced without a proper drain, leaving a stale VolumeAttachment pointing at a now-gone node — Module 5 Lab 4's scenario via routine ops.
-Confirm: kubectl get volumeattachment for one referencing a node that no longer exists.
-Lesson: Node replacement must cordon+drain before termination, or you inherit the stuck-VolumeAttachment problem as routine fallout.
+**11 — One namespace has no external egress, internal fine, other namespaces on same nodes fine**
 
-17 — Cron job fails only on the last day of the month
-Cause: A date-math bug in the job's own code (month-boundary/day-31 edge case) — genuinely an application bug, not infrastructure.
-Confirm: Check the job's logs from a failing run for a date-parsing error.
-Lesson: Not everything is a Kubernetes problem — calendar-aligned failures are a classic app-code signature; don't reach for infra diagnostics first.
+**Cause:** A NetworkPolicy scoped to that namespace with a default-deny egress rule that never allowlisted external CIDRs — since other namespaces on the same nodes are unaffected, this rules out node/CNI/security-group causes immediately.
+**Confirm:** kubectl get networkpolicy -n data-pipeline — check egress rules for missing external CIDR allowance.
+**Fix:** Add an explicit egress rule for required external ranges/ports.
+**Lesson:** Same default-deny trap as Module 4, but namespace-scoped — "other namespaces fine, same nodes" should point you straight at NetworkPolicy, not infrastructure.
 
-18 — kubectl get pods slow, only in one namespace
-Cause: That namespace has accumulated a huge number of uncleaned objects (completed Jobs/Pods with no TTL), making list operations against it genuinely slower.
-Confirm: kubectl get pods -n <ns> --no-headers | wc -l (and Jobs/Events) vs a normal namespace.
-Lesson: Object hygiene matters — ttlSecondsAfterFinished on Jobs exists specifically to prevent this.
+**12 — Prometheus goes dark during the actual incident**
 
+**Cause:** The incident itself (mass pod restarts, label churn) is spiking Prometheus's own time-series cardinality, pushing it over its own memory limit right when it's needed most — the "who watches the watchmen" problem.
+**Confirm:** Check if the Prometheus pod itself restarted/OOMKilled around that time; its own self-scraped prometheus_tsdb_head_series metric for a spike.
+**Fix:** Raise Prometheus's resource limits with real headroom, reduce label cardinality sources, and seriously consider isolating your monitoring stack's blast radius from what it watches.
+**Lesson:** Your observability stack is a workload subject to every failure mode in Modules 1–7 — including failing exactly when incident-driven churn stresses it hardest.
 
+**13 — Job's pod exits 0, Job never shows Complete**
 
+**Cause:** .spec.completions is set >1 and not all required successful completions have happened yet.
+**Confirm:** kubectl get job -o yaml — compare completions vs status.succeeded.
+**Lesson:** One successful pod ≠ Job done if it needs N successes — check the completions count first.
 
+**14 — App can't reach its own sidecar on localhost**
 
+**Cause:** Regular containers in a pod don't start in guaranteed order — the app started before the sidecar was actually listening.
+**Confirm:** Check the sidecar's own readiness/logs at that moment.
+**Lesson:** "localhost" doesn't mean "already listening" — use native sidecars (restartPolicy: Always init containers) or add retry logic.
 
+**15 — Deployment scaled to 10, only 7 come up, no errors "anywhere"**
 
+**Cause:** Almost always a ResourceQuota nobody remembered exists — or the missing 3 are sitting Pending with FailedScheduling events nobody actually checked.
+**Confirm:** kubectl get resourcequota -n <ns>; check the missing pods' own status directly.
+**Lesson:** "No errors anywhere" often just means nobody checked the individual pod events yet.
+
+**16 — After AMI upgrade, PVC pods hit Multi-Attach without scaling**
+
+**Cause:** Nodes were replaced without a proper drain, leaving a stale VolumeAttachment pointing at a now-gone node — Module 5 Lab 4's scenario via routine ops.
+**Confirm:** kubectl get volumeattachment for one referencing a node that no longer exists.
+**Lesson:** Node replacement must cordon+drain before termination, or you inherit the stuck-VolumeAttachment problem as routine fallout.
+
+**17 — Cron job fails only on the last day of the month**
+
+**Cause:** A date-math bug in the job's own code (month-boundary/day-31 edge case) — genuinely an application bug, not infrastructure.
+**Confirm:** Check the job's logs from a failing run for a date-parsing error.
+**Lesson:** Not everything is a Kubernetes problem — calendar-aligned failures are a classic app-code signature; don't reach for infra diagnostics first.
+
+**18 — kubectl get pods slow, only in one namespace**
+**Cause:** That namespace has accumulated a huge number of uncleaned objects (completed Jobs/Pods with no TTL), making list operations against it genuinely slower.
+**Confirm:** kubectl get pods -n <ns> --no-headers | wc -l (and Jobs/Events) vs a normal namespace.
+**Lesson:** Object hygiene matters — ttlSecondsAfterFinished on Jobs exists specifically to prevent this.
 
 
 
