@@ -144,22 +144,23 @@ kubectl exec -it -n kube-system etcd-k8s-mastery-control-plane -- \
 ## Part 5: Interview Questions — Day 1
 
 Practice answering these out loud:
-Q1: What happens if etcd goes down?
+
+**Q1: What happens if etcd goes down?**
 
 The cluster continues running existing workloads (kubelet doesn't need etcd), but no new changes can be made — no deployments, no scaling, nothing. It's read-only effectively.
 
-Q2: Can you run workloads on the control plane node?
+**Q2: Can you run workloads on the control plane node?**
 
 By default no — a taint (node-role.kubernetes.io/control-plane:NoSchedule) prevents it. You can remove the taint but it's not recommended in production.
 
-Q3: What's the difference between kube-scheduler and controller-manager?
+**Q3: What's the difference between kube-scheduler and controller-manager?**
 
 Scheduler decides where a pod runs. Controller-manager ensures the desired state is maintained (right number of replicas, etc).
 
-Q4: Is the API server stateless?
+**Q4: Is the API server stateless?**
 
 Yes. All state lives in etcd. That's why you can run multiple API server replicas for HA with a load balancer in front.
 
-Q5: What is a watch in Kubernetes?
+**Q5: What is a watch in Kubernetes?**
 
 Kubernetes components don't poll — they use etcd watches (long-lived HTTP connections). When state changes, etcd pushes a notification. This is how the scheduler instantly knows a new pod is Pending.
