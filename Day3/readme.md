@@ -421,23 +421,23 @@ kubectl delete pod load-gen
 
 ## Part 8: Interview Questions — Day 3
 
-Q1: Deployment vs StatefulSet — when do you use each?
+**Q1: Deployment vs StatefulSet — when do you use each?**
 
 Deployment for stateless apps (web servers, APIs) — pods are interchangeable, no stable identity needed. StatefulSet for stateful apps (databases, Kafka, Zookeeper) — each pod needs a stable hostname, stable storage, and ordered operations.
 
-Q2: A Deployment has 3 replicas. You delete one pod. What happens?
+**Q2: A Deployment has 3 replicas. You delete one pod. What happens?**
 
 The ReplicaSet controller detects actual (2) != desired (3) and immediately creates a new pod. The deleted pod is gone in seconds and a replacement is running. You cannot "permanently" delete a pod managed by a ReplicaSet without scaling down.
 
-Q3: What's the difference between maxSurge and maxUnavailable?
+**Q3: What's the difference between maxSurge and maxUnavailable?**
 
 maxSurge: how many extra pods above desired can exist during rollout. maxUnavailable: how many pods below desired can be unavailable. For zero-downtime: maxSurge: 1, maxUnavailable: 0. For resource-constrained: maxSurge: 0, maxUnavailable: 1.
 
-Q4: Why does a StatefulSet need a headless Service?
+**Q4: Why does a StatefulSet need a headless Service?**
 
 A headless Service (clusterIP: None) creates individual DNS A records for each pod (pod-0.svc.namespace...). Without it, pods have no stable network identity — you'd only get a shared ClusterIP that load-balances randomly, which breaks consensus protocols like Raft or Kafka leadership.
 
-Q5: Job restartPolicy — why can't you use Always?
+**Q5: Job restartPolicy — why can't you use Always?**
 
 Always means "restart container when it exits" — that's for long-running services. A Job's whole purpose is to complete and stop. OnFailure retries on non-zero exit. Never lets the Job controller handle retries by starting new pods. Always would loop forever.
 
