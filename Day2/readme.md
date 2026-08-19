@@ -186,7 +186,8 @@ kubectl get pod <name> -o jsonpath='{.status.qosClass}'
 ```
 
 ### Part 6: Hands-On Exercises
-Exercise 1: Deploy your URL shortener as a Pod with probes
+
+**Exercise 1: Deploy your URL shortener as a Pod with probes**
 
 ```
 cat <<EOF | kubectl apply -f -
@@ -259,7 +260,7 @@ spec:
 EOF
 ```
 
-Exercise 2: Observe pod lifecycle in real time
+**Exercise 2: Observe pod lifecycle in real time**
 
 ```
 # Watch the pod go through phases
@@ -275,7 +276,7 @@ kubectl describe pod advanced-app-pod | grep -A 20 Events
 kubectl get pod advanced-app-pod -o jsonpath='{.status.qosClass}'
 ```
 
-Exercise 3: Trigger a liveness failure
+**Exercise 3: Trigger a liveness failure**
 
 ```
 # Exec into pod and kill the process — watch K8s restart it
@@ -286,7 +287,7 @@ kubectl get pod advanced-app-pod -w
 # You'll see RESTARTS go from 0 → 1
 ```
 
-Exercise 4: Multi-container sidecar pod
+**Exercise 4: Multi-container sidecar pod**
 
 ```
 cat <<EOF | kubectl apply -f -
