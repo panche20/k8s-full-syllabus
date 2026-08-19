@@ -320,27 +320,28 @@ kubectl logs sidecar-demo -c reader -f
 ```
 
 ### Part 7: Interview Questions — Day 2
-Q1: What's the difference between livenessProbe and readinessProbe?
 
-Liveness: "is the process alive?" — failure restarts the container. Readiness: "is it ready for traffic?" — failure removes it from Service endpoints without restarting. A pod can be Running but not Ready.
+**Q1: What's the difference between livenessProbe and readinessProbe?**
 
-Q2: You have a slow-starting Java app that takes 3 minutes to boot. How do you configure probes?
+**Liveness**: "is the process alive?" — failure restarts the container. **Readiness**: "is it ready for traffic?" — failure removes it from Service endpoints without restarting. A pod can be Running but not Ready.
+
+**Q2: You have a slow-starting Java app that takes 3 minutes to boot. How do you configure probes?**
 
 Use startupProbe with failureThreshold: 18 and periodSeconds: 10 (= 3 min). Once it passes, liveness kicks in. Without startupProbe, liveness would kill it before it finishes booting.
 
-Q3: What is a QoS class and why does it matter?
+**Q3: What is a QoS class and why does it matter?**
 
 Kubernetes uses QoS to decide which pods to evict under memory pressure. Guaranteed pods (requests == limits) are evicted last. BestEffort (no requests/limits) are first. Critical production pods should be Guaranteed.
 
-Q4: Two containers in a Pod — can they share files?
+**Q4: Two containers in a Pod — can they share files?**
 
 Yes — mount the same emptyDir volume in both containers. They share the same filesystem path. This is the sidecar pattern's core mechanism.
 
-Q5: What happens to an emptyDir volume when a pod restarts vs is deleted?
+**Q5: What happens to an emptyDir volume when a pod restarts vs is deleted?**
 
 Container restart (same pod): emptyDir persists. Pod deletion: emptyDir is gone permanently. Use a PVC if you need data to survive pod deletion.
 
-Q6: What is the pause container?
+**Q6: What is the pause container?**
 
 Every pod has a hidden pause container injected by kubelet. It holds the network namespace (IP address) for the pod. All app containers join this network. If the pause container dies, all containers in the pod restart.
 
