@@ -359,7 +359,21 @@ kubectl get secret db-creds -o jsonpath='{.data.password}' | base64 -d
 **Exercise 3: Full PV → PVC → Pod pipeline**
 
 ```
-# Static PV
+
+# 1. Create the Host Directory on the Target Worker Node
+Pick one worker node where the storage directory will reside (e.g., node01 or your EC2 instance hostname):
+
+# SSH into your worker node (or master if single-node cluster)
+sudo mkdir -p /tmp/k8s-data
+sudo chmod 777 /tmp/k8s-data
+
+# 2. Lock the PV and Pods to that Node (Node Affinity)
+Get your worker node's exact name:
+
+kubectl get nodes
+
+# Assuming your node name is worker-node-1 (replace with your actual node name):
+
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolume
@@ -373,6 +387,14 @@ spec:
   storageClassName: manual
   hostPath:
     path: /tmp/k8s-data
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - worker-node-1
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -390,10 +412,12 @@ kind: Pod
 metadata:
   name: storage-test
 spec:
+  nodeSelector:
+    kubernetes.io/hostname: worker-node-1
   containers:
   - name: writer
     image: busybox
-    command: ["sh","-c","echo 'data written' > /data/test.txt && sleep 3600"]
+    command: ["sh", "-c", "echo 'data written' > /data/test.txt && sleep 3600"]
     volumeMounts:
     - name: storage
       mountPath: /data
@@ -403,31 +427,32 @@ spec:
       claimName: local-pvc
 EOF
 
-# Verify PVC bound
-kubectl get pvc local-pvc
-# STATUS should be Bound
+# 3. Verify the Binding and Data Write
+Check PV and PVC status:
 
-# Check data was written
+kubectl get pv,pvc
+
 kubectl exec storage-test -- cat /data/test.txt
+# Output: data written
 
-# Delete pod — data persists on PV
+# 4. Delete the Writer Pod and Read with a New Pod
+Delete the original pod:
+
 kubectl delete pod storage-test
 
-# New pod reads the same data
+# Deploy the reader pod (pinned to the same worker node):
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
   name: storage-reader
 spec:
+  nodeSelector:
+    kubernetes.io/hostname: worker-node-1
   containers:
   - name: reader
     image: busybox
-    command: 
-    - sh
-    - -c
-    - |
-      sleep 3600
+    command: ["sh", "-c", "sleep 3600"]
     volumeMounts:
     - name: storage
       mountPath: /data
@@ -437,11 +462,18 @@ spec:
       claimName: local-pvc
 EOF
 
+# Verify data persisted:
+
 kubectl exec storage-reader -- cat /data/test.txt
-# data written  ← survived pod deletion
+# Output: data written
+
+# 5. Clean Up
+kubectl delete pod storage-reader
+kubectl delete pvc local-pvc
+kubectl delete pv local-pv
 ```
 
-**Exercise 4: StatefulSet with volumeClaimTemplates (production pattern)*
+**Exercise 4: StatefulSet with volumeClaimTemplates (production pattern)**
 
 ```
 cat <<EOF | kubectl apply -f -
@@ -510,7 +542,7 @@ kubectl exec postgres-0 -- psql -U admin -c "\dt"   # table still exists
 
 ## Part 9: Interview Questions — Day 5
 
-**Q1: What's the difference between a ConfigMap and a Secret?*
+**Q1: What's the difference between a ConfigMap and a Secret?**
 
 Both are key-value stores in etcd. Secrets are base64-encoded and can have encryption at rest enabled via EncryptionConfiguration. ConfigMaps are plain text. Secrets also have typed subtypes (tls, dockerconfigjson, etc.) that Kubernetes understands natively. In practice the main difference is intent — Secrets signal sensitive data and can be locked down via RBAC independently.
 
@@ -518,7 +550,7 @@ Both are key-value stores in etcd. Secrets are base64-encoded and can have encry
 
 Three checks: does a PV exist with matching storageClassName? Does the PV have enough capacity (PV >= PVC request)? Does the access mode match? If using dynamic provisioning, check if the StorageClass exists and the provisioner pod is running. Fix whichever check fails.
 
-**Q3: What happens to a PV when its PVC is deleted, with reclaimPolicy: Retain?*
+**Q3: What happens to a PV when its PVC is deleted, with reclaimPolicy: Retain?**
 
 The PV moves to Released state. The data is safe but the PV is not automatically available for new claims — it still has the old claim reference. An admin must manually edit or delete the PV to make it Available again. With Delete policy, both PV and underlying storage are deleted automatically.
 
@@ -526,7 +558,7 @@ The PV moves to Released state. The data is safe but the PV is not automatically
 
 With the default Immediate mode, the PV is provisioned the moment a PVC is created — in a specific availability zone. If the pod then gets scheduled to a different AZ, it can't mount the volume. WaitForFirstConsumer delays provisioning until the pod is scheduled, so the volume is created in the same AZ as the pod.
 
-**Q5: Can two pods on different nodes mount the same PVC?*
+**Q5: Can two pods on different nodes mount the same PVC?**
 
 Only if the access mode is ReadWriteMany (RWX) — supported by NFS, AWS EFS, Azure Files. Block storage like AWS EBS only supports ReadWriteOnce (RWO) — one node at a time. Trying to mount an RWO volume from a second node will leave the second pod in ContainerCreating state.
 
