@@ -277,7 +277,7 @@ volumes:
 
 ## Part 8: Hands-On Exercises
 
-**Exercise 1: ConfigMap live reload*
+**Exercise 1: ConfigMap live reload**
 
 ```
 # Create a ConfigMap
@@ -316,13 +316,13 @@ kubectl create configmap live-config \
 
 ```
 
-**Exercise 2: Secret — create, consume, decode*
+**Exercise 2: Secret — create, consume, decode**
 
 ```
 # Create secret
 kubectl create secret generic db-creds \
-  --from-literal=username=admin \
-  --from-literal=password=S3cr3t!
+  --from-literal='username=admin' \
+  --from-literal='password=S3cr3t!'
 
 # Consume as env vars
 cat <<EOF | kubectl apply -f -
@@ -331,10 +331,11 @@ kind: Pod
 metadata:
   name: secret-test
 spec:
+  restartPolicy: Never
   containers:
   - name: app
     image: busybox
-    command: ["sh","-c","echo user=$DB_USER pass=$DB_PASS && sleep 3600"]
+    command: ["sh", "-c", "echo user=\$DB_USER pass=\$DB_PASS && sleep 3600"]
     env:
     - name: DB_USER
       valueFrom:
@@ -355,7 +356,7 @@ kubectl logs secret-test
 kubectl get secret db-creds -o jsonpath='{.data.password}' | base64 -d
 ```
 
-**Exercise 3: Full PV → PVC → Pod pipeline*
+**Exercise 3: Full PV → PVC → Pod pipeline**
 
 ```
 # Static PV
