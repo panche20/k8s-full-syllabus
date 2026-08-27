@@ -476,14 +476,56 @@ kubectl delete pv local-pv
 **Exercise 4: StatefulSet with volumeClaimTemplates (production pattern)**
 
 ```
+1. Create the Host Directory and Pre-requisite Secret
+
+Run on your target EC2 worker node:
+
+Bash
+sudo mkdir -p /tmp/postgres-data
+sudo chmod 777 /tmp/postgres-data
+Ensure the secret exists:
+
+Bash
+kubectl create secret generic db-creds \
+  --from-literal='username=admin' \
+  --from-literal='password=S3cr3t!' \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+2. Deploy the Static PV, Headless Service, and StatefulSet
+
+Replace <YOUR_WORKER_NODE_NAME> with your node's hostname from kubectl get nodes:
+
+YAML
 cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pgdata-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  hostPath:
+    path: /tmp/postgres-data
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - worker-node-1
+---
 apiVersion: v1
 kind: Service
 metadata:
   name: postgres-headless
 spec:
   clusterIP: None
-  selector: {app: postgres}
+  selector:
+    app: postgres
   ports:
   - port: 5432
 ---
@@ -502,10 +544,14 @@ spec:
       labels:
         app: postgres
     spec:
+      nodeSelector:
+        kubernetes.io/hostname: worker-node-1
       containers:
       - name: postgres
         image: postgres:15-alpine
         env:
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
         - name: POSTGRES_PASSWORD
           valueFrom:
             secretKeyRef:
@@ -524,20 +570,37 @@ spec:
       name: pgdata
     spec:
       accessModes: [ReadWriteOnce]
+      storageClassName: manual
       resources:
         requests:
           storage: 1Gi
 EOF
+3. Verify Binding and Pod Startup
 
-# Each StatefulSet pod gets its own auto-created PVC
-kubectl get pvc
-# pgdata-postgres-0 → Bound
+Check that the generated PVC matches and binds to the static PV:
 
-# Prove data persists across pod restart
-kubectl exec postgres-0 -- psql -U admin -c "CREATE TABLE test (id serial);"
+Bash
+kubectl get pvc,pv
+# pgdata-postgres-0 should show STATUS: Bound to pgdata-pv
+
+kubectl get pods -l app=postgres
+# postgres-0 should reach Running (1/1)
+4. Test Data Persistence Across Pod Deletion
+
+Create a test table inside Postgres:
+
+Bash
+kubectl exec -it postgres-0 -- psql -U admin -d postgres -c "CREATE TABLE test_table (id serial PRIMARY KEY, data text);"
+kubectl exec -it postgres-0 -- psql -U admin -d postgres -c "INSERT INTO test_table (data) VALUES ('persistent_hello');"
+Delete the Pod:
+
+Bash
 kubectl delete pod postgres-0
-kubectl get pod -w   # postgres-0 restarts
-kubectl exec postgres-0 -- psql -U admin -c "\dt"   # table still exists
+Wait for StatefulSet to recreate it, then verify data survived:
+
+Bash
+kubectl wait --for=condition=Ready pod/postgres-0 --timeout=60s
+kubectl exec -it postgres-0 -- psql -U admin -d postgres -c "SELECT * FROM test_table;"
 ```
 
 ## Part 9: Interview Questions — Day 5
