@@ -293,7 +293,7 @@ spec:
   containers:
   - name: reader
     image: busybox
-    command: ["sh","-c","while true; do cat /etc/config/MESSAGE; sleep 5; done"]
+    command: ["sh", "-c", "while true; do cat /etc/config/MESSAGE; echo ''; sleep 5; done"]
     volumeMounts:
     - name: cfg
       mountPath: /etc/config
