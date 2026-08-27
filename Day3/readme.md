@@ -386,10 +386,10 @@ spec:
 EOF
 
 # Watch jobs being created every minute
-kubectl get jobs -w
+kubectl get cronjobs.batch
 
 # See logs from completed job
-kubectl logs -l job-name=$(kubectl get jobs --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
+kubectl logs -l job-name=$(kubectl get jobs --sort-by=.metadata.creationTimestamp -o custom-columns=":metadata.name" --no-headers | tail -n 1)
 ```
 
 **Exercise 4: HPA load test**
