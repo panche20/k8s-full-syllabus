@@ -230,131 +230,91 @@ BestEffort
 
 # Task 8 – NetworkPolicy
 
-## Objective
+**Step 1: Ensure namespace exists and deploy Pods & Services**
 
-Restrict access to backend so only frontend can communicate with it.
-
----
-
-## Create Namespace
-
-```bash
-kubectl create namespace ckad-8
+```
+kubectl create namespace ckad-8 --dry-run=client -o yaml | kubectl apply -f -
 ```
 
----
+**Deploy the frontend and backend pods:**
 
-## Deploy Applications
-
-```bash
-kubectl run frontend \
-  --image=nginx:1.25 \
-  --labels=tier=frontend \
-  -n ckad-8
-
-kubectl run backend \
-  --image=nginx:1.25 \
-  --labels=tier=backend \
-  -n ckad-8
+```
+kubectl run frontend --image=nginx:1.25 --labels="tier=frontend" -n ckad-8
+kubectl run backend --image=nginx:1.25 --labels="tier=backend" -n ckad-8
 ```
 
-Expose Services:
+*Expose both as ClusterIP services on port 80:*
 
-```bash
-kubectl expose pod frontend \
-  --port=80 \
-  -n ckad-8
-
-kubectl expose pod backend \
-  --port=80 \
-  -n ckad-8
+```
+kubectl expose pod frontend --port=80 --target-port=80 -n ckad-8
+kubectl expose pod backend --port=80 --target-port=80 -n ckad-8
 ```
 
----
+**Step 2: Baseline verification**
 
-## Verify Baseline Connectivity
+Test that frontend can communicate with backend:
 
-```bash
-kubectl run tester \
-  --image=busybox:1.35 \
-  --rm -it \
-  --restart=Never \
-  -n ckad-8 -- sh
+```
+kubectl exec -n ckad-8 frontend -- curl -s --connect-timeout 2 http://backend
 ```
 
-Inside:
+*(You will see the default NGINX HTML output).*
 
-```bash
-wget -qO- http://backend
+**Step 3: Create and apply the NetworkPolicy**
+
+Save the following manifest as backend-netpol.yaml:
+
 ```
-
-Expected:
-
-```html
-Welcome to nginx!
-```
-
----
-
-## Create NetworkPolicy
-
-```yaml
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: backend-policy
+  name: allow-frontend-to-backend
   namespace: ckad-8
 spec:
   podSelector:
     matchLabels:
       tier: backend
-
   policyTypes:
   - Ingress
-
   ingress:
   - from:
     - podSelector:
         matchLabels:
           tier: frontend
-
     ports:
     - protocol: TCP
       port: 80
 ```
 
-Apply:
+**Apply the policy:**
 
-```bash
-kubectl apply -f backend-policy.yaml
+```
+kubectl apply -f backend-netpol.yaml
 ```
 
----
+**Step 4: Verify traffic restrictions**
 
-## Verify Policy
+Verify allowed access (frontend):
 
-Create attacker:
-
-```bash
-kubectl run attacker \
-  --image=busybox:1.35 \
-  --labels=tier=hacker \
-  -n ckad-8
+```
+kubectl exec -n ckad-8 frontend -- curl -s --connect-timeout 2 http://backend
 ```
 
-Frontend should succeed:
+*(Returns NGINX HTML successfully).*
 
-```bash
-kubectl exec frontend -n ckad-8 -- wget -qO- http://backend
+**Deploy the attacker pod and test denied access:**
+
+```
+kubectl run attacker --image=nginx:1.25 --labels="tier=hacker" -n ckad-8
 ```
 
-Attacker should fail:
+*Once attacker is running, attempt to reach backend:*
 
-```bash
-kubectl exec attacker -n ckad-8 -- wget -T 3 -qO- http://backend
+```
+kubectl exec -n ckad-8 attacker -- curl -s --connect-timeout 2 http://backend
 ```
 
----
+*(Command times out with exit code 28, confirming incoming traffic is blocked).*
 
 # Task 9 – Services and DNS
 
