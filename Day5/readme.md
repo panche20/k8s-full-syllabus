@@ -476,7 +476,7 @@ kubectl delete pv local-pv
 **Exercise 4: StatefulSet with volumeClaimTemplates (production pattern)**
 
 ```
-1. Create the Host Directory and Pre-requisite Secret
+# 1. Create the Host Directory and Pre-requisite Secret
 
 Run on your target EC2 worker node:
 
@@ -491,7 +491,7 @@ kubectl create secret generic db-creds \
   --from-literal='password=S3cr3t!' \
   --dry-run=client -o yaml | kubectl apply -f -
 
-2. Deploy the Static PV, Headless Service, and StatefulSet
+# 2. Deploy the Static PV, Headless Service, and StatefulSet
 
 Replace <YOUR_WORKER_NODE_NAME> with your node's hostname from kubectl get nodes:
 
@@ -575,7 +575,8 @@ spec:
         requests:
           storage: 1Gi
 EOF
-3. Verify Binding and Pod Startup
+
+# 3. Verify Binding and Pod Startup
 
 Check that the generated PVC matches and binds to the static PV:
 
@@ -585,7 +586,8 @@ kubectl get pvc,pv
 
 kubectl get pods -l app=postgres
 # postgres-0 should reach Running (1/1)
-4. Test Data Persistence Across Pod Deletion
+
+# 4. Test Data Persistence Across Pod Deletion
 
 Create a test table inside Postgres:
 
