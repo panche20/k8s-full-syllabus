@@ -287,15 +287,17 @@ kubectl exec config-pod -n ckad-4 -- ls /etc/config
 
 ## Task 5 – Persistent Storage
 
-### Namespace
+**Step 1: Ensure the namespace exists**
 
-```bash
-kubectl create ns ckad-5
+```
+kubectl create namespace ckad-5 --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-### PV + PVC + Pod
+**Step 2: Create the PersistentVolume (task-pv)**
 
-```yaml
+PersistentVolumes are cluster-scoped, so do not set a namespace on the PV manifest. Save this as pv.yaml:
+
+```
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -303,17 +305,25 @@ metadata:
 spec:
   capacity:
     storage: 500Mi
-
   accessModes:
-  - ReadWriteOnce
-
-  storageClassName: manual
-
+    - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
-
+  storageClassName: manual
   hostPath:
     path: /tmp/ckad-data
----
+```
+
+**Apply the PV:**
+
+```
+kubectl apply -f pv.yaml
+```
+
+**Step 3: Create the PersistentVolumeClaim (task-pvc)**
+
+Save this as pvc.yaml:
+
+```
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -321,50 +331,71 @@ metadata:
   namespace: ckad-5
 spec:
   accessModes:
-  - ReadWriteOnce
-
+    - ReadWriteOnce
   storageClassName: manual
-
   resources:
     requests:
       storage: 200Mi
----
+```
+
+**Apply the PVC:**
+
+```
+kubectl apply -f pvc.yaml
+```
+
+**Step 4: Create the Pod (storage-pod)**
+
+Save this as pod.yaml:
+
+```
 apiVersion: v1
 kind: Pod
 metadata:
   name: storage-pod
   namespace: ckad-5
 spec:
-  containers:
-  - name: writer
-    image: busybox
-
-    command:
-    - sh
-    - -c
-    - |
-      echo "ckad exam data" > /data/result.txt
-      sleep 3600
-
-    volumeMounts:
-    - mountPath: /data
-      name: storage
-
   volumes:
-  - name: storage
+  - name: storage-vol
     persistentVolumeClaim:
       claimName: task-pvc
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sh", "-c", "echo 'ckad exam data' > /data/result.txt && sleep 3600"]
+    volumeMounts:
+    - name: storage-vol
+      mountPath: /data
 ```
 
-Verification:
+**Apply the Pod:**
 
-```bash
-kubectl get pvc -n ckad-5
-kubectl exec storage-pod -n ckad-5 -- cat /data/result.txt
+```
+kubectl apply -f pod.yaml
 ```
 
-Expected:
+**Step 5: Verify the PVC is Bound and verify the data**
 
-```text
+Check that the PVC status is Bound:
+
+```
+kubectl get pvc task-pvc -n ckad-5
+```
+
+**Ensure the Pod is running:**
+
+```
+kubectl get pod storage-pod -n ckad-5
+```
+
+**Read the file from the Pod:**
+
+```
+kubectl exec -it storage-pod -n ckad-5 -- cat /data/result.txt
+```
+
+**Expected output:**
+
+```
 ckad exam data
 ```
