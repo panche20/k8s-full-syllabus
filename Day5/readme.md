@@ -394,7 +394,7 @@ spec:
         - key: kubernetes.io/hostname
           operator: In
           values:
-          - worker-node-1
+          - worker-1
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -448,7 +448,7 @@ metadata:
   name: storage-reader
 spec:
   nodeSelector:
-    kubernetes.io/hostname: worker-node-1
+    kubernetes.io/hostname: worker-1
   containers:
   - name: reader
     image: busybox
@@ -516,7 +516,7 @@ spec:
         - key: kubernetes.io/hostname
           operator: In
           values:
-          - worker-node-1
+          - worker-1
 ---
 apiVersion: v1
 kind: Service
@@ -545,7 +545,7 @@ spec:
         app: postgres
     spec:
       nodeSelector:
-        kubernetes.io/hostname: worker-node-1
+        kubernetes.io/hostname: worker-1
       containers:
       - name: postgres
         image: postgres:15-alpine
