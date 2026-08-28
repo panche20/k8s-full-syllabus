@@ -359,96 +359,63 @@ kubectl get secret db-creds -o jsonpath='{.data.password}' | base64 -d
 **Exercise 3: Full PV → PVC → Pod pipeline**
 
 ```
-
-# 1. Create the Host Directory on the Target Worker Node
-Pick one worker node where the storage directory will reside (e.g., node01 or your EC2 instance hostname):
-
-# SSH into your worker node (or master if single-node cluster)
-sudo mkdir -p /tmp/k8s-data
-sudo chmod 777 /tmp/k8s-data
-
-# 2. Lock the PV and Pods to that Node (Node Affinity)
-Get your worker node's exact name:
-
-kubectl get nodes
-
-# Assuming your node name is worker-node-1 (replace with your actual node name):
+# Step 1: Deploy the Dynamic PVC and Writer Pod
+Apply the PVC and the writer Pod in one step:
 
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: local-pv
-spec:
-  capacity:
-    storage: 1Gi
-  accessModes: [ReadWriteOnce]
-  persistentVolumeReclaimPolicy: Retain
-  storageClassName: manual
-  hostPath:
-    path: /tmp/k8s-data
-  nodeAffinity:
-    required:
-      nodeSelectorTerms:
-      - matchExpressions:
-        - key: kubernetes.io/hostname
-          operator: In
-          values:
-          - worker-1
----
-apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: local-pvc
+  name: dynamic-pvc
 spec:
   accessModes: [ReadWriteOnce]
-  storageClassName: manual
   resources:
     requests:
-      storage: 500Mi
+      storage: 1Gi
 ---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: storage-test
+  name: storage-writer
 spec:
-  nodeSelector:
-    kubernetes.io/hostname: worker-node-1
   containers:
   - name: writer
     image: busybox
-    command: ["sh", "-c", "echo 'data written' > /data/test.txt && sleep 3600"]
+    command: ["sh", "-c", "echo 'data written with dynamic storage' > /data/test.txt && sleep 3600"]
     volumeMounts:
     - name: storage
       mountPath: /data
   volumes:
   - name: storage
     persistentVolumeClaim:
-      claimName: local-pvc
+      claimName: dynamic-pvc
 EOF
 
-# 3. Verify the Binding and Data Write
-Check PV and PVC status:
+# Step 2: Verify Dynamic Provisioning and Data Write
+Check that the PVC automatically provisioned a PV and is Bound:
 
-kubectl get pv,pvc
+kubectl get pvc dynamic-pvc
+kubectl get pv
 
-kubectl exec storage-test -- cat /data/test.txt
-# Output: data written
+# Verify that the data was written inside the pod:
 
-# 4. Delete the Writer Pod and Read with a New Pod
-Delete the original pod:
+kubectl exec storage-writer -- cat /data/test.txt
+# Output: data written with dynamic storage
 
-kubectl delete pod storage-test
+# Step 3: Delete the Writer Pod
+Delete the writer pod. The PVC and dynamically provisioned volume will remain intact:
 
-# Deploy the reader pod (pinned to the same worker node):
+kubectl delete pod storage-writer
+
+# Step 4: Deploy the Reader Pod Using the Same PVC
+Deploy a new pod that attaches to the existing PVC:
+
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
   name: storage-reader
 spec:
-  nodeSelector:
-    kubernetes.io/hostname: worker-1
   containers:
   - name: reader
     image: busybox
@@ -459,18 +426,23 @@ spec:
   volumes:
   - name: storage
     persistentVolumeClaim:
-      claimName: local-pvc
+      claimName: dynamic-pvc
 EOF
 
-# Verify data persisted:
+# Step 5: Verify Data Survived Pod Deletion
 
 kubectl exec storage-reader -- cat /data/test.txt
-# Output: data written
+# Output: data written with dynamic storage
 
-# 5. Clean Up
+# Step 6: Clean Up
+Deleting the PVC triggers the StorageClass reclaim policy (usually Delete), which automatically destroys the underlying PV:
+
 kubectl delete pod storage-reader
-kubectl delete pvc local-pvc
-kubectl delete pv local-pv
+kubectl delete pvc dynamic-pvc
+
+# Verify that the PV is automatically cleaned up:
+
+kubectl get pv
 ```
 
 **Exercise 4: StatefulSet with volumeClaimTemplates (production pattern)**
