@@ -92,12 +92,12 @@ Tue Jun 24 10:01:04 UTC 2026
 ### Create Namespace
 
 ```bash
-kubectl create ns ckad-2
+kubectl create namespace ckad-2 --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 ### Pod Manifest
 
-```yaml
+```
 apiVersion: v1
 kind: Pod
 metadata:
@@ -106,20 +106,13 @@ metadata:
 spec:
   initContainers:
   - name: check-svc
-    image: busybox
-    command:
-    - sh
-    - -c
-    - |
-      until nslookup backend
-      do
-        echo waiting for backend
-        sleep 2
-      done
-
+    image: busybox:1.28
+    command: ['sh', '-c', 'until nslookup backend; do echo waiting for backend; sleep 2; done']
   containers:
   - name: app
     image: nginx:1.25
+    ports:
+    - containerPort: 80
 ```
 
 Apply:
@@ -130,23 +123,14 @@ kubectl apply -f pod.yaml
 
 ### Create Backend Service
 
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: backend
-  namespace: ckad-2
-spec:
-  selector:
-    app: backend
-  ports:
-  - port: 80
+```
+kubectl create service clusterip backend --tcp=80:80 -n ckad-2
 ```
 
 Verification:
 
 ```bash
-kubectl get pod -n ckad-2
+kubectl get pod app-with-init -n ckad-2 -w
 ```
 
 Expected:
