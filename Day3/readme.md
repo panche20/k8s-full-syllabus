@@ -401,6 +401,9 @@ kubectl set resources deployment hpa-demo \
   --requests=cpu=100m,memory=64Mi \
   --limits=cpu=200m,memory=128Mi
 
+# Expose deployment (Create service)
+kubectl expose deployment hpa-demo --port=80 --target-port=80
+
 # Create HPA
 kubectl autoscale deployment hpa-demo --cpu-percent=50 --min=1 --max=5
 
