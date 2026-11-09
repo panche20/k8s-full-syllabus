@@ -359,6 +359,19 @@ kubectl get secret db-creds -o jsonpath='{.data.password}' | base64 -d
 **Exercise 3: Full PV → PVC → Pod pipeline**
 
 ```
+# Set Up the Dynamic Storage Provisioner
+
+# 1. Deploy the Local Path Provisioner
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml
+
+# 2. Set 'local-path' as the default StorageClass
+kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+# 3. Verify the StorageClass exists and is flagged as (default)
+kubectl get storageclass
+```
+
+```
 # Step 1: Deploy the Dynamic PVC and Writer Pod
 Apply the PVC and the writer Pod in one step:
 
