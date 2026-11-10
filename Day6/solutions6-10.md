@@ -6,19 +6,19 @@
 * Create a CronJob that runs every 2 minutes.
 * Configure Job retry behavior and CronJob concurrency policy.
 
----
-
-## Create Namespace
-
-```bash
-kubectl create namespace ckad-6
 ```
+# Step 1: Create the Namespace
+kubectl create namespace ckad-6
 
----
+# Step 2: Create the Job (pi-job)
+kubectl create job pi-job \
+  --image=perl:5.34 \
+  --namespace=ckad-6 \
+  --dry-run=client -o yaml \
+  -- perl -Mbignum=bpi -wle 'print bpi(500)' > job.yaml
 
-## Create Job
+# Edit job.yaml to include backoffLimit: 2 and completions: 1 under spec:
 
-```yaml
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -27,47 +27,26 @@ metadata:
 spec:
   completions: 1
   backoffLimit: 2
-
   template:
     spec:
+      containers:
+      - name: pi-job
+        image: perl:5.34
+        command: ["perl", "-Mbignum=bpi", "-wle", "print bpi(500)"]
       restartPolicy: Never
 
-      containers:
-      - name: pi
-        image: perl:5.34
-        command:
-        - perl
-        - -Mbignum=bpi
-        - -wle
-        - print bpi(500)
-```
+# Apply the Job:
+kubectl apply -f job.yaml
 
-Apply:
+# Step 3: Create the CronJob (cleanup)
+kubectl create cronjob cleanup \
+  --image=busybox \
+  --schedule="*/2 * * * *" \
+  --namespace=ckad-6 \
+  --dry-run=client -o yaml \
+  -- /bin/sh -c 'echo cleanup ran at $(date)' > cronjob.yaml
 
-```bash
-kubectl apply -f pi-job.yaml
-```
-
----
-
-## Verify Job
-
-```bash
-kubectl get jobs -n ckad-6
-kubectl logs job/pi-job -n ckad-6
-```
-
-Expected:
-
-```text
-3.14159265358979323846...
-```
-
----
-
-## Create CronJob
-
-```yaml
+# Edit cronjob.yaml to add concurrencyPolicy: Forbid under spec:
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -75,52 +54,45 @@ metadata:
   namespace: ckad-6
 spec:
   schedule: "*/2 * * * *"
-
   concurrencyPolicy: Forbid
-
   jobTemplate:
     spec:
       template:
         spec:
-          restartPolicy: Never
-
           containers:
           - name: cleanup
             image: busybox
-            command:
-            - sh
-            - -c
-            - echo cleanup ran at $(date)
-```
+            command: ["/bin/sh", "-c", "echo cleanup ran at $(date)"]
+          restartPolicy: OnFailure
 
-Apply:
+# Apply the CronJob:
+kubectl apply -f cronjob.yaml
 
-```bash
-kubectl apply -f cleanup-cronjob.yaml
-```
+# Step 4: Verification
+1. Verify pi-job
+Check that the job pod ran and completed successfully:
 
----
+kubectl get job pi-job -n ckad-6
 
-## Verify CronJob
+Expected status: COMPLETIONS: 1/1
+Check the computed $\pi$ digits in the pod logs:
 
-```bash
-kubectl get cronjobs -n ckad-6
+kubectl logs -n ckad-6 -l job-name=pi-job
+
+# 2. Verify cleanup CronJob
+Check the CronJob status:
+
+kubectl get cronjob cleanup -n ckad-6
+
+# Wait up to 2 minutes, then check that the scheduled Job was spawned and completed:
 kubectl get jobs -n ckad-6 --watch
+
+# Check the log output from the triggered CronJob pod:
+kubectl logs -n ckad-6 -l job-name=$(kubectl get jobs -n ckad-6 -o jsonpath='{.items[-1].metadata.name}')
+
+# Check logs:
+kubectl logs -n ckad-6 -l job-name=cleanup-29905210
 ```
-
-Inspect logs:
-
-```bash
-kubectl logs <job-pod-name> -n ckad-6
-```
-
-Expected:
-
-```text
-cleanup ran at Tue Jun 24 10:30:00 UTC 2026
-```
-
----
 
 # Task 7 – Resource Limits and QoS Classes
 
