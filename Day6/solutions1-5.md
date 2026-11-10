@@ -247,29 +247,19 @@ spec:
   containers:
   - name: app
     image: busybox
-
-    command:
-    - sh
-    - -c
-    - |
-      env
-      sleep 3600
-
+    command: ["sh", "-c", "env && sleep 3600"]
     envFrom:
     - configMapRef:
         name: app-config
-
     env:
     - name: API_KEY
       valueFrom:
         secretKeyRef:
           name: app-secret
           key: API_KEY
-
     volumeMounts:
     - mountPath: /etc/config
       name: config-vol
-
   volumes:
   - name: config-vol
     configMap:
