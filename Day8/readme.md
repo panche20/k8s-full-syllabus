@@ -460,39 +460,236 @@ kubectl auth can-i list deployments --as=myuser                 # no (cluster-wi
 **Exercise 4: SA token inspection**
 
 ```
-# Create a pod with a SA
-kubectl create sa inspector -n rbac-test
+# Step 1 — Create the namespace and ServiceAccount
 
-kubectl run inspector-pod \
-  --image=curlimages/curl:latest \
-  --overrides='{"spec":{"serviceAccountName":"inspector"}}' \
-  --command -- sleep 3600 \
-  -n rbac-test
+kubectl create namespace rbac-test
+kubectl create serviceaccount inspector -n rbac-test
+kubectl get sa inspector -n rbac-test
 
-# Exec in and read the projected token
+# Step 2 — Create the Pod
+# Create inspector-pod.yaml:
+
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inspector-pod
+  namespace: rbac-test
+spec:
+  serviceAccountName: inspector
+  automountServiceAccountToken: true
+
+  containers:
+    - name: inspector
+      image: curlimages/curl:latest
+      command:
+        - sleep
+        - "3600"
+
+kubectl apply -f inspector-pod.yaml
+kubectl get pod inspector-pod -n rbac-test
+
+# Check which ServiceAccount the Pod uses:
+kubectl get pod inspector-pod \
+  -n rbac-test \
+  -o jsonpath='{.spec.serviceAccountName}'
+
+# Expected:
+inspector
+
+# Step 3 — Inspect the projected ServiceAccount token
+
 kubectl exec -n rbac-test inspector-pod -- \
-  cat /var/run/secrets/kubernetes.io/serviceaccount/token
+  ls -l /var/run/secrets/kubernetes.io/serviceaccount/
 
-# Read namespace and CA cert
+# Expected files:
+ca.crt
+namespace
+token
+
+# Read the namespace:
 kubectl exec -n rbac-test inspector-pod -- \
   cat /var/run/secrets/kubernetes.io/serviceaccount/namespace
 
-# Use the token to call the API server from inside the pod
-kubectl exec -n rbac-test inspector-pod -- sh -c '
-  TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-  curl -sk \
-    -H "Authorization: Bearer $TOKEN" \
-    https://kubernetes.default.svc/api/v1/namespaces/rbac-test/pods
-'
-# Will get 403 Forbidden — SA has no RBAC yet
+# Expected:
+rbac-test
 
-# Grant it and retry
-kubectl create rolebinding inspector-binding \
-  --role=pod-log-reader \
-  --serviceaccount=rbac-test:inspector \
+# Read the token:
+kubectl exec -n rbac-test inspector-pod -- \
+  cat /var/run/secrets/kubernetes.io/serviceaccount/token
+
+# Step 4 — Test API access BEFORE granting RBAC
+
+kubectl exec -n rbac-test inspector-pod -- sh -c '
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+
+curl --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+  -H "Authorization: Bearer $TOKEN" \
+  https://kubernetes.default.svc/api/v1/namespaces/rbac-test/pods
+'
+
+# Expected response:
+{
+  "kind": "Status",
+  "apiVersion": "v1",
+  "metadata": {},
+  "status": "Failure",
+  "message": "pods is forbidden: User \"system:serviceaccount:rbac-test:inspector\" cannot list resource \"pods\" in API group \"\" in the namespace \"rbac-test\"",
+  "reason": "Forbidden",
+  "code": 403
+}
+
+# Step 5 — Create a Role with least privilege
+# Create pod-reader-role.yaml:
+
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: rbac-test
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+
+
+kubectl apply -f pod-reader-role.yaml
+kubectl describe role pod-reader -n rbac-test
+
+# Step 6 — Bind the Role to the ServiceAccount
+# Create pod-reader-rolebinding.yaml:
+
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: inspector-binding
+  namespace: rbac-test
+subjects:
+  - kind: ServiceAccount
+    name: inspector
+    namespace: rbac-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pod-reader
+
+kubectl apply -f pod-reader-rolebinding.yaml
+kubectl describe rolebinding inspector-binding -n rbac-test
+
+# Step 7 — Retry the API request
+
+kubectl exec -n rbac-test inspector-pod -- sh -c '
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+
+curl --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+  -H "Authorization: Bearer $TOKEN" \
+  https://kubernetes.default.svc/api/v1/namespaces/rbac-test/pods
+'
+
+# Expected:
+{
+  "kind": "PodList",
+  "apiVersion": "v1",
+  "metadata": {
+    "resourceVersion": "..."
+  },
+  "items": []
+}
+
+# Initially, items will be empty because no other Pods exist in the namespace.
+# Let's create one:
+
+kubectl run test-nginx \
+  --image=nginx \
   -n rbac-test
 
-# Now the API call returns pod list
+# Retry the API call.
+# Expected:
+
+{
+  "kind": "PodList",
+  "apiVersion": "v1",
+  "items": [
+    {
+      "metadata": {
+        "name": "inspector-pod"
+      }
+    },
+    {
+      "metadata": {
+        "name": "test-nginx"
+      }
+    }
+  ]
+}
+
+# Step 8 — Validate permissions like a Kubernetes administrator
+
+# Test 1: Can inspector list Pods?
+
+kubectl auth can-i list pods \
+  --as=system:serviceaccount:rbac-test:inspector \
+  -n rbac-test
+
+# Expected:
+yes
+
+# Test 2: Can inspector delete Pods?
+
+kubectl auth can-i delete pods \
+  --as=system:serviceaccount:rbac-test:inspector \
+  -n rbac-test
+
+# Expected:
+no
+
+# Test 3: Can inspector read Secrets?
+
+kubectl auth can-i get secrets \
+  --as=system:serviceaccount:rbac-test:inspector \
+  -n rbac-test
+
+# Expected:
+no
+
+# Test 4: Can inspector list Pods in another namespace?
+
+kubectl auth can-i list pods \
+  --as=system:serviceaccount:rbac-test:inspector \
+  -n default
+
+# Expected:
+no
+
+# Bonus — Extend the lab to Pod log access
+
+Your original Role name was pod-log-reader. If your actual goal is to let the ServiceAccount read logs, add the pods/log subresource.
+Modify the Role:
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-log-reader
+  namespace: rbac-test
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+
+kubectl exec -n rbac-test inspector-pod -- sh -c '
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+
+curl --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+  -H "Authorization: Bearer $TOKEN" \
+  "https://kubernetes.default.svc/api/v1/namespaces/rbac-test/pods/test-nginx/log"
+'
 ```
 
 ## Part 11: Interview Questions — Day 9
