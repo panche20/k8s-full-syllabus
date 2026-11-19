@@ -381,18 +381,62 @@ kubectl get configmap -n before-backup       # canary-config back
 
 ```
 # Check all cert expiry dates
-docker exec k8s-mastery-control-plane kubeadm certs check-expiration
+sudo kubeadm certs check-expiration
 
 # Check a specific cert in detail
-docker exec k8s-mastery-control-plane \
-  openssl x509 \
+openssl x509 \
   -in /etc/kubernetes/pki/apiserver.crt \
   -noout -text | grep -E "Not Before|Not After|Subject|DNS|IP"
 
 # Renew all (safe to run even if certs aren't expiring soon)
-docker exec k8s-mastery-control-plane kubeadm certs renew all
-docker exec k8s-mastery-control-plane kubeadm certs check-expiration
+sudo kubeadm certs renew all
+sudo kubeadm certs check-expiration
 # Dates should now be 1 year from today
+
+# On your control-plane node, check the manifests:
+ls -l /etc/kubernetes/manifests/
+
+# You should see something similar to:
+etcd.yaml
+kube-apiserver.yaml
+kube-controller-manager.yaml
+kube-scheduler.yaml
+
+# Static pods are managed by kubelet. The recommended approach is to temporarily move the manifest outside the manifests directory.
+# For example, restart the API server:
+
+sudo mv /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/
+sleep 20
+sudo mv /tmp/kube-apiserver.yaml /etc/kubernetes/manifests/
+
+# Update your admin kubeconfig
+# When you renew admin.conf, its embedded client certificate is also renewed.
+# However, if you previously copied it to your user's home directory, that copy still contains the old certificate.
+# Update it:
+
+mkdir -p $HOME/.kube
+sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# Test:
+kubectl get nodes
+
+# Verify certificate expiration
+# After restarting the components, execute:
+
+sudo kubeadm certs check-expiration
+
+# You should see the renewed expiration dates.
+# You can also inspect an individual certificate:
+
+sudo openssl x509 \
+  -in /etc/kubernetes/pki/apiserver.crt \
+  -noout -dates
+
+# Check cluster health:
+kubectl get nodes
+kubectl get pods -n kube-system
+kubectl get --raw='/readyz?verbose'
 ```
 
 **Exercise 3: Enable audit logging**
