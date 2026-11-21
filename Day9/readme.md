@@ -393,6 +393,9 @@ sudo kubeadm certs renew all
 sudo kubeadm certs check-expiration
 # Dates should now be 1 year from today
 
+# Check if able to get nodes using admin.conf
+sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
+
 # On your control-plane node, check the manifests:
 ls -l /etc/kubernetes/manifests/
 
